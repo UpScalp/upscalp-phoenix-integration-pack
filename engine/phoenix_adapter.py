@@ -1,12 +1,13 @@
 """Phoenix native SDK boundary; no import-time connection or default wallet."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
-from typing import Mapping
+from typing import Mapping, TypedDict
 from urllib.parse import urlsplit
 
 
@@ -14,11 +15,45 @@ PHOENIX_PLATFORM_ID = "phoenix"
 PHOENIX_PROGRAM_ID = "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih"
 
 
-def phoenix_no_order_probe(
+class PhoenixPreparedTransaction(TypedDict):
+    transaction_base64: str
+    transaction_sha256: str
+    signature: str
+    submitted: bool
+    fee_lamports: int
+    payer_balance_lamports: int
+    simulation_slot: int
+    last_valid_block_height: int
+    blockhash: str
+
+
+class PhoenixNativeResult(TypedDict, total=False):
+    status: str
+    operation: str
+    wallet_address: str
+    delegate_address: str
+    trader_account: str
+    finalized_slot: int
+    state_sha256: str
+    state: dict[str, object]
+    prepared: PhoenixPreparedTransaction
+
+
+def phoenix_account_operation(
     credentials: Mapping[str, str], *, executable: str, executable_sha256: str,
-    rpc_url: str, genesis_hash: str,
-) -> dict[str, object]:
-    """Validate one delegated primary account; never sign or submit a transaction."""
+    rpc_url: str, genesis_hash: str, request: Mapping[str, object], api_url: str = "",
+) -> PhoenixNativeResult:
+    """Bound native read/prepare call. Prepared bytes are never a placement receipt."""
+    operation = request.get("operation")
+    keys = {"validate_connection": {"operation"}, "read_state": {"operation", "symbol"},
+            "prepare_entry": {"operation", "entry", "expected_state_sha256"},
+            "prepare_close": {"operation", "close", "expected_state_sha256"}}
+    if not isinstance(operation, str) or operation not in keys or set(request) != keys[operation]:
+        raise ValueError("Phoenix operation inputs are incomplete or unsupported")
+    if operation != "validate_connection":
+        endpoint = urlsplit(api_url)
+        if endpoint.scheme != "https" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.fragment:
+            raise ValueError("Phoenix metadata endpoint is incomplete or invalid")
     path = Path(executable)
     endpoint = urlsplit(rpc_url)
     if (
@@ -38,17 +73,19 @@ def phoenix_no_order_probe(
             raise ValueError("Phoenix native executable hash mismatch")
     except OSError:
         raise RuntimeError("Phoenix native executable is unavailable") from None
-    request = {
-        "operation": "validate_connection",
+    payload = {
+        **request,
         "wallet_address": credentials.get("wallet_address", ""),
         "private_key": credentials.get("private_key", ""),
         "rpc_url": rpc_url,
         "genesis_hash": genesis_hash,
     }
+    if operation != "validate_connection":
+        payload["api_url"] = api_url
     try:
         completed = subprocess.run(
-            [str(path)], input=json.dumps(request), text=True, capture_output=True,
-            timeout=40, check=False,
+            [str(path)], input=json.dumps(payload, allow_nan=False), text=True, capture_output=True,
+            timeout=120 if operation != "validate_connection" else 40, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         # Timeout exceptions retain input: never forward their repr/message.
@@ -62,7 +99,7 @@ def phoenix_no_order_probe(
         raise RuntimeError("Phoenix account or delegation could not be verified")
     if (
         result.get("platform") != PHOENIX_PLATFORM_ID
-        or result.get("wallet_address") != request["wallet_address"]
+        or result.get("wallet_address") != payload["wallet_address"]
         or result.get("genesis_hash") != genesis_hash
         or result.get("program_id") != PHOENIX_PROGRAM_ID
         or result.get("scope") != "primary_cross_margin"
@@ -74,6 +111,40 @@ def phoenix_no_order_probe(
                for key in ("delegate_address", "trader_account"))
     ):
         raise RuntimeError("Phoenix native account response binding failed")
+    if operation != "validate_connection":
+        state = result.get("state")
+        plan = request.get("entry", request.get("close", {}))
+        symbol = request.get("symbol") if operation == "read_state" else plan.get("symbol") if isinstance(plan, Mapping) else None
+        if (result.get("operation") != operation or not isinstance(state, dict) or not symbol
+            or state.get("symbol") != symbol or type(state.get("signed_base_lots")) is not int
+            or not isinstance(state.get("conditionals"), list)
+            or not isinstance(result.get("state_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", result["state_sha256"])):
+            raise RuntimeError("Phoenix native state binding failed")
+        if operation.startswith("prepare_"):
+            prepared = result.get("prepared")
+            if not isinstance(prepared, dict) or result["state_sha256"] != request["expected_state_sha256"]:
+                raise RuntimeError("Phoenix prepared state binding failed")
+            try:
+                raw = base64.b64decode(prepared["transaction_base64"], validate=True)
+                valid = (0 < len(raw) <= 1232 and hashlib.sha256(raw).hexdigest() == prepared["transaction_sha256"]
+                         and prepared["submitted"] is False and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{64,88}", prepared["signature"])
+                         and all(type(prepared.get(k)) is int and prepared[k] >= 0 for k in ("fee_lamports", "payer_balance_lamports"))
+                         and prepared["payer_balance_lamports"] >= prepared["fee_lamports"]
+                         and all(type(prepared.get(k)) is int and prepared[k] > 0 for k in ("simulation_slot", "last_valid_block_height")))
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise RuntimeError("Phoenix prepared bytes binding failed")
+    return result
+
+
+def phoenix_no_order_probe(
+    credentials: Mapping[str, str], *, executable: str, executable_sha256: str,
+    rpc_url: str, genesis_hash: str,
+) -> dict[str, object]:
+    """Validate one delegated primary account; never sign or submit a transaction."""
+    result = phoenix_account_operation(credentials, executable=executable, executable_sha256=executable_sha256,
+        rpc_url=rpc_url, genesis_hash=genesis_hash, request={"operation": "validate_connection"})
     # Connection validation is separate from funds, execution activation and custody approval.
     return {
         "delegation_verified": True, "scope": "primary_cross_margin",

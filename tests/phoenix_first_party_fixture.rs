@@ -31,7 +31,7 @@ fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
     entry["expected_state_sha256"] = serde_json::json!("0".repeat(64));
     entry["entry"] = serde_json::json!({"symbol":"BTC", "direction":"SHORT", "base_lots":100,
         "max_quote_lots":2_000_000_000_u64, "reference_price":100_000.0, "limit_price":99_000.0,
-        "stop_price":102_000.0, "stop_execution_price":102_100.0,
+        "stop_price":102_000.0, "stop_execution_price":102_100.0, "stop_execution_band_pct":1.0,
         "targets":[{"price":98_000.0,"base_lots":40},{"price":97_000.0,"base_lots":60}],
         "client_order_id":123,"last_valid_slot":1100});
     let request: native::Request = serde_json::from_value(entry.clone()).unwrap();
@@ -117,6 +117,51 @@ async fn delegated_short_is_atomic_with_full_stop_and_exact_split_targets() {
     delegated_protected_lifecycle(false).await;
 }
 
+#[tokio::test]
+async fn stop_band_is_explicit_one_percent_after_tick_rounding() {
+    let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
+    let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
+    ctx.execute_setup();
+    let owner = ctx.actor_pubkey("taker0");
+    let delegate = ctx.actor_pubkey("taker1");
+    let address = ctx.actor_trader("taker0");
+    let ix: Instruction = create_delegate_trader_ix(DelegateTraderParams::builder()
+        .trader_wallet(owner).trader_account(address).new_position_authority(delegate).build().unwrap()).unwrap().into();
+    ctx.send_instructions(vec![ix], &ctx.actor("taker0").seed, "synthetic-band-delegation");
+    let data = ctx.account_data(&address);
+    let account = FetchedAccount::new(data.clone(), *PHOENIX_PROGRAM_ID, false);
+    let metadata = phoenix_metadata_from_fixture(&ctx.fixture);
+    let builder = PhoenixTxBuilder::new(&metadata);
+    let calc = builder.order_ticket_metadata("BTC").unwrap().market_calc;
+    for long in [true, false] {
+        let base = calc.price_to_ticks(if long { 98_000.0 } else { 102_000.0 }).unwrap().as_inner();
+        let stop = base / 100 * 100 + 51;
+        let boundary = if long { stop - stop / 100 } else { stop + stop / 100 };
+        let plan = native::EntryPlan {
+            symbol:"BTC".into(), direction:if long { "LONG" } else { "SHORT" }.into(),
+            base_lots:100, max_quote_lots:2_000_000_000, reference_price:100_000.0,
+            limit_price:if long { 101_000.0 } else { 99_000.0 },
+            stop_price:calc.ticks_to_price(stop.into()), stop_execution_price:calc.ticks_to_price(boundary.into()),
+            stop_execution_band_pct:1.0,
+            targets:vec![native::Target {price:if long { 102_000.0 } else { 98_000.0 },base_lots:100}],
+            client_order_id:123,last_valid_slot:1100,
+        };
+        assert!(native::build_protected_entry(&metadata,owner,delegate,&account,None,1000,&plan).await.is_ok());
+        let outside = if long { boundary - 1 } else { boundary + 1 };
+        for bad in [
+            native::EntryPlan {stop_execution_price:calc.ticks_to_price(outside.into()),..plan.clone()},
+            native::EntryPlan {stop_execution_price:plan.stop_price * if long {0.99} else {1.01},..plan.clone()},
+            native::EntryPlan {stop_execution_band_pct:10.0,..plan.clone()},
+            native::EntryPlan {stop_execution_band_pct:0.0,..plan.clone()},
+            native::EntryPlan {stop_execution_band_pct:f64::NAN,..plan.clone()},
+        ] {
+            assert_eq!(native::build_protected_entry(&metadata,owner,delegate,&account,None,1000,&bad).await.unwrap_err(),"stop_execution_band_invalid");
+        }
+    }
+    assert_eq!(data,ctx.account_data(&address));
+    println!("UPSCALP_STOP_BAND explicit_one_percent=true long_short_tick_boundary=true outward_rounding_refused=true builder_writes=0");
+}
+
 async fn delegated_protected_lifecycle(long: bool) {
     let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
     let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
@@ -138,6 +183,7 @@ async fn delegated_protected_lifecycle(long: bool) {
         symbol: "BTC".into(), direction: if long { "LONG" } else { "SHORT" }.into(), base_lots: 100, max_quote_lots: 2_000_000_000,
         reference_price: 100_000.0, limit_price: if long { 101_000.0 } else { 99_000.0 },
         stop_price: if long { 98_000.0 } else { 102_000.0 }, stop_execution_price: if long { 97_900.0 } else { 102_100.0 },
+        stop_execution_band_pct: 1.0,
         targets: vec![native::Target { price: if long { 102_000.0 } else { 98_000.0 }, base_lots: 40 },
             native::Target { price: if long { 103_000.0 } else { 97_000.0 }, base_lots: 60 }],
         client_order_id: 123, last_valid_slot: slot + 100,

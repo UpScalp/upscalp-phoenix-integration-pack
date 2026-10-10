@@ -109,6 +109,7 @@ pub struct EntryPlan {
     pub stop_price: f64,
     // Required explicitly: the SDK's default 10% IOC band is not product policy.
     pub stop_execution_price: f64,
+    pub stop_execution_band_pct: f64,
     pub targets: Vec<Target>,
     pub client_order_id: u128,
     pub last_valid_slot: u64,
@@ -148,6 +149,12 @@ pub async fn build_protected_entry(
     if (long && (limit < entry || stop >= entry || stop_execution > stop))
         || (!long && (limit > entry || stop <= entry || stop_execution < stop)) {
         return Err("protection_geometry_invalid");
+    }
+    // Phoenix-only 1% maximum, measured from the encoded trigger.
+    // Integer tick arithmetic also refuses nearest rounding outside the band.
+    if plan.stop_execution_band_pct != 1.0
+        || u128::from(stop.abs_diff(stop_execution)) * 100 > u128::from(stop) {
+        return Err("stop_execution_band_invalid");
     }
     let mut previous = limit;
     for target in &plan.targets {
