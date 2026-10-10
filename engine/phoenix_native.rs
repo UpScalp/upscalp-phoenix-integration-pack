@@ -2,11 +2,12 @@
 // never read a wallet file, environment secret, or default wallet.
 use std::{io::{self, Read}, str::FromStr, time::Duration};
 
-use phoenix_rise::{accounts::owned::Trader, core::{FetchedAccount, TraderKey}, ix::PHOENIX_PROGRAM_ID};
+use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Trader}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use solana_commitment_config::CommitmentConfig;
 use solana_keypair::Keypair;
+use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
@@ -50,6 +51,171 @@ pub fn validate_account(owner: Pubkey, delegate: Pubkey, address: Pubkey, accoun
         "delegation_verified": true,
         "execution_ready": false
     }))
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub price: f64,
+    pub base_lots: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryPlan {
+    pub symbol: String,
+    pub direction: String,
+    pub base_lots: u64,
+    pub max_quote_lots: u64,
+    pub reference_price: f64,
+    pub limit_price: f64,
+    pub stop_price: f64,
+    // Required explicitly: the SDK's default 10% IOC band is not product policy.
+    pub stop_execution_price: f64,
+    pub targets: Vec<Target>,
+    pub client_order_id: u128,
+    pub last_valid_slot: u64,
+}
+
+pub async fn build_protected_entry(
+    metadata: &PhoenixMetadata, owner: Pubkey, delegate: Pubkey,
+    trader_account: &FetchedAccount, conditional_account: Option<&FetchedAccount>,
+    current_slot: u64, plan: &EntryPlan,
+) -> Result<Vec<Instruction>, &'static str> {
+    let trader = TraderKey::new(owner).pda();
+    validate_account(owner, delegate, trader, trader_account)?;
+    let builder = PhoenixTxBuilder::new(metadata);
+    let market = metadata.get_market(&plan.symbol).ok_or("market_unknown")?;
+    let state = Trader::try_from_account_bytes(&trader_account.data).map_err(|_| "trader_account_invalid")?;
+    if state.position_entries().any(|row| row.asset_id == u64::from(market.asset_id) && row.position.base_lot_position.as_inner() != 0) {
+        return Err("existing_position_refused");
+    }
+    let long = match plan.direction.as_str() { "LONG" => true, "SHORT" => false, _ => return Err("direction_invalid") };
+    if current_slot == 0 || plan.last_valid_slot <= current_slot || plan.client_order_id == 0
+        || plan.base_lots == 0 || plan.max_quote_lots == 0 || !(1..=2).contains(&plan.targets.len())
+        || plan.targets.iter().try_fold(0_u64, |sum, target| sum.checked_add(target.base_lots)) != Some(plan.base_lots)
+        || plan.targets.iter().any(|target| target.base_lots == 0) {
+        return Err("entry_size_or_expiry_invalid");
+    }
+    let calc = builder.order_ticket_metadata(&plan.symbol).map_err(|_| "market_unknown")?.market_calc;
+    let ticks = |price: f64| -> Result<u64, &'static str> {
+        if !price.is_finite() || price <= 0.0 { return Err("price_invalid"); }
+        let value = calc.price_to_ticks(price).map_err(|_| "price_invalid")?.as_inner();
+        if value == 0 || value == u64::MAX { return Err("price_invalid"); }
+        Ok(value)
+    };
+    let entry = ticks(plan.reference_price)?;
+    let limit = ticks(plan.limit_price)?;
+    let stop = ticks(plan.stop_price)?;
+    let stop_execution = ticks(plan.stop_execution_price)?;
+    if (long && (limit < entry || stop >= entry || stop_execution > stop))
+        || (!long && (limit > entry || stop <= entry || stop_execution < stop)) {
+        return Err("protection_geometry_invalid");
+    }
+    let mut previous = limit;
+    for target in &plan.targets {
+        let price = ticks(target.price)?;
+        if (long && price <= previous) || (!long && price >= previous) { return Err("target_geometry_invalid"); }
+        previous = price;
+    }
+    let mut ixs = Vec::new();
+    if let Some(account) = conditional_account {
+        if account.owner != Some(*PHOENIX_PROGRAM_ID) || account.executable { return Err("conditional_account_invalid"); }
+        let collection = ConditionalOrderCollection::try_from_account_bytes(&account.data).map_err(|_| "conditional_account_invalid")?;
+        if collection.header.trader_key != trader
+            || collection.active_orders().any(|(_, order)| order.asset_id == market.asset_id)
+            || (collection.header.capacity as usize) < collection.active_order_indices.len() + plan.targets.len() + 1 {
+            return Err("conditional_inventory_refused");
+        }
+    } else {
+        ixs.extend(builder.build_create_conditional_orders_account(delegate, delegate, trader, 8).map_err(|_| "conditional_build_failed")?);
+    }
+    let side = if long { Side::Bid } else { Side::Ask };
+    let ticket = MarketOrderTicket::builder().authority(delegate).trader_account(trader)
+        .symbol(&plan.symbol).side(side).price(plan.limit_price).num_base_lots(plan.base_lots)
+        .num_quote_lots(plan.max_quote_lots).min_base_lots_to_fill(plan.base_lots)
+        .client_order_id(plan.client_order_id).last_valid_slot(plan.last_valid_slot)
+        .self_trade_behavior(SelfTradeBehavior::Abort).order_flags(OrderFlags::None)
+        .cancel_existing(false).build().map_err(|_| "entry_build_failed")?;
+    ixs.extend(builder.place_market_order(ticket).await.map_err(|_| "entry_build_failed")?);
+    // Atomic transaction: all entry lots and all protection, or none. The stop
+    // tracks the remaining position; fixed TP lots preserve the configured split.
+    ixs.extend(builder.build_bracket_leg_orders(delegate, trader, &plan.symbol, side, &BracketLegOrders {
+        stop_loss: Some(BracketLeg::new(plan.stop_price).with_ioc_order().with_execution_price(plan.stop_execution_price)
+            .with_size(BracketLegSize::PositionPercent(100))), take_profit: None,
+    }).map_err(|_| "stop_build_failed")?);
+    for target in &plan.targets {
+        ixs.extend(builder.build_bracket_leg_orders(delegate, trader, &plan.symbol, side, &BracketLegOrders {
+            stop_loss: None, take_profit: Some(BracketLeg::new(target.price).with_limit_order().with_execution_price(target.price)
+                .with_size(BracketLegSize::BaseLots(target.base_lots))),
+        }).map_err(|_| "target_build_failed")?);
+    }
+    Ok(ixs)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosePlan {
+    pub symbol: String,
+    pub signed_base_lots: i64,
+    pub position_sequence: u8,
+    pub conditionals: Vec<(u8, u64)>,
+    pub limit_price: f64,
+    pub max_quote_lots: u64,
+    pub client_order_id: u128,
+    pub last_valid_slot: u64,
+}
+
+pub async fn build_protected_close(
+    metadata: &PhoenixMetadata, owner: Pubkey, delegate: Pubkey,
+    trader_account: &FetchedAccount, conditional_account: &FetchedAccount,
+    current_slot: u64, plan: &ClosePlan,
+) -> Result<Vec<Instruction>, &'static str> {
+    let trader = TraderKey::new(owner).pda();
+    validate_account(owner, delegate, trader, trader_account)?;
+    let market = metadata.get_market(&plan.symbol).ok_or("market_unknown")?;
+    let state = Trader::try_from_account_bytes(&trader_account.data).map_err(|_| "trader_account_invalid")?;
+    let position = state.position_entries().find(|row| row.asset_id == u64::from(market.asset_id)).ok_or("position_absent")?;
+    if plan.signed_base_lots == 0 || plan.signed_base_lots == i64::MIN
+        || position.position.base_lot_position.as_inner() != plan.signed_base_lots
+        || position.position.position_sequence_number != plan.position_sequence {
+        return Err("position_binding_changed");
+    }
+    if current_slot == 0 || plan.last_valid_slot <= current_slot || plan.client_order_id == 0
+        || plan.max_quote_lots == 0 || !plan.limit_price.is_finite() || plan.limit_price <= 0.0 {
+        return Err("close_price_or_expiry_invalid");
+    }
+    if conditional_account.owner != Some(*PHOENIX_PROGRAM_ID) || conditional_account.executable {
+        return Err("conditional_account_invalid");
+    }
+    let collection = ConditionalOrderCollection::try_from_account_bytes(&conditional_account.data).map_err(|_| "conditional_account_invalid")?;
+    let actual: Vec<_> = collection.active_orders().filter(|(_, order)| order.asset_id == market.asset_id)
+        .map(|(index, order)| (index, order.sequence_number)).collect();
+    if collection.header.trader_key != trader || actual != plan.conditionals || actual.is_empty() || actual.len() > 3 {
+        return Err("conditional_inventory_changed");
+    }
+    let builder = PhoenixTxBuilder::new(metadata);
+    let ticks = builder.order_ticket_metadata(&plan.symbol).map_err(|_| "market_unknown")?.market_calc
+        .price_to_ticks(plan.limit_price).map_err(|_| "close_price_or_expiry_invalid")?.as_inner();
+    if ticks == 0 || ticks == u64::MAX { return Err("close_price_or_expiry_invalid"); }
+    let lots = plan.signed_base_lots.unsigned_abs();
+    let ticket = MarketOrderTicket::builder().authority(delegate).trader_account(trader)
+        .symbol(&plan.symbol).side(if plan.signed_base_lots > 0 { Side::Ask } else { Side::Bid })
+        .price(plan.limit_price).num_base_lots(lots).num_quote_lots(plan.max_quote_lots).min_base_lots_to_fill(lots)
+        .client_order_id(plan.client_order_id).last_valid_slot(plan.last_valid_slot)
+        .self_trade_behavior(SelfTradeBehavior::Abort).order_flags(OrderFlags::ReduceOnly)
+        .cancel_existing(false).build().map_err(|_| "close_build_failed")?;
+    let mut ixs = builder.place_market_order(ticket).await.map_err(|_| "close_build_failed")?;
+    // Close and disable exactly the observed, ledger-bound protection together.
+    // No cancel-all and no source of authority to adopt an external position.
+    let orderbook = Pubkey::from_str(&market.market_pubkey).map_err(|_| "market_invalid")?;
+    for (index, _) in actual {
+        let params = CancelConditionalOrderParams::builder().trader_account(trader).position_authority(delegate)
+            .orderbook(orderbook).conditional_order_index(index).disable_first(true).disable_second(true)
+            .build().map_err(|_| "close_build_failed")?;
+        ixs.push(create_cancel_conditional_order_ix(params).map_err(|_| "close_build_failed")?.into());
+    }
+    Ok(ixs)
 }
 
 fn run(request: Request) -> Result<Value, &'static str> {
