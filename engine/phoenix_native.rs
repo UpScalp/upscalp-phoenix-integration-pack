@@ -2,7 +2,7 @@
 // never read a wallet file, environment secret, or default wallet.
 use std::{io::{self, Read}, str::FromStr, time::Duration};
 
-use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Orderbook, Trader}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
+use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Orderbook, Trader, StopLossDirection, StopLossOrderKind, StopLossTradeSide}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,6 +29,7 @@ pub struct Request {
     symbol: Option<String>,
     entry: Option<EntryPlan>,
     close: Option<ClosePlan>,
+    replace_stop: Option<ReplaceStopPlan>,
     expected_state_sha256: Option<String>,
     prepared: Option<Value>,
 }
@@ -40,14 +41,17 @@ impl Request {
         if retained != self.prepared.is_some() {
             return Err("prepared_inputs_invalid");
         }
+        let plans = usize::from(self.entry.is_some()) + usize::from(self.close.is_some()) + usize::from(self.replace_stop.is_some());
         let symbol = match self.operation.as_str() {
-            "validate_connection" if self.symbol.is_none() && self.entry.is_none() && self.close.is_none()
+            "validate_connection" if self.symbol.is_none() && plans == 0
                 && self.expected_state_sha256.is_none() && self.api_url.is_none() => return Ok(None),
-            "read_state" if self.entry.is_none() && self.close.is_none() && self.expected_state_sha256.is_none() => self.symbol.as_deref(),
-            "prepare_entry" if self.symbol.is_none() && self.close.is_none() => self.entry.as_ref().map(|p| p.symbol.as_str()),
-            "prepare_close" if self.symbol.is_none() && self.entry.is_none() => self.close.as_ref().map(|p| p.symbol.as_str()),
-            "read_submission" | "submit_prepared" if self.symbol.is_none() && (self.entry.is_some() != self.close.is_some()) =>
-                self.entry.as_ref().map(|p| p.symbol.as_str()).or_else(|| self.close.as_ref().map(|p| p.symbol.as_str())),
+            "read_state" if plans == 0 && self.expected_state_sha256.is_none() => self.symbol.as_deref(),
+            "prepare_entry" if self.symbol.is_none() && plans == 1 => self.entry.as_ref().map(|p| p.symbol.as_str()),
+            "prepare_close" if self.symbol.is_none() && plans == 1 => self.close.as_ref().map(|p| p.symbol.as_str()),
+            "prepare_replace_stop" if self.symbol.is_none() && plans == 1 => self.replace_stop.as_ref().map(|p| p.symbol.as_str()),
+            "read_submission" | "submit_prepared" if self.symbol.is_none() && plans == 1 =>
+                self.entry.as_ref().map(|p| p.symbol.as_str()).or_else(|| self.close.as_ref().map(|p| p.symbol.as_str()))
+                    .or_else(|| self.replace_stop.as_ref().map(|p| p.symbol.as_str())),
             _ => return Err("operation_inputs_invalid"),
         }.filter(|s| !s.is_empty() && s.trim() == *s).ok_or("symbol_required")?;
         if !self.api_url.as_deref().is_some_and(valid_https_endpoint) { return Err("metadata_endpoint_required"); }
@@ -270,6 +274,80 @@ pub async fn build_protected_close(
     Ok(ixs)
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceStopPlan {
+    pub symbol: String,
+    pub signed_base_lots: i64,
+    pub position_sequence: u8,
+    pub conditionals: Vec<(u8, u64)>,
+    pub old_stop: (u8, u64),
+    pub trigger_price: f64,
+    pub execution_price: f64,
+    pub last_valid_slot: u64,
+}
+
+pub fn build_replace_stop(metadata: &PhoenixMetadata, owner: Pubkey, delegate: Pubkey,
+    trader_account: &FetchedAccount, conditional_account: &FetchedAccount,
+    current_slot: u64, plan: &ReplaceStopPlan) -> Result<Vec<Instruction>, &'static str> {
+    let trader = TraderKey::new(owner).pda();
+    validate_account(owner, delegate, trader, trader_account)?;
+    let market = metadata.get_market(&plan.symbol).ok_or("market_unknown")?;
+    let state = Trader::try_from_account_bytes(&trader_account.data).map_err(|_| "trader_account_invalid")?;
+    let position = state.position_entries().find(|p| p.asset_id == u64::from(market.asset_id)).ok_or("position_absent")?;
+    if plan.signed_base_lots == 0 || plan.signed_base_lots == i64::MIN
+        || position.position.base_lot_position.as_inner() != plan.signed_base_lots
+        || position.position.position_sequence_number != plan.position_sequence {
+        return Err("position_binding_changed");
+    }
+    if current_slot == 0 || plan.last_valid_slot <= current_slot { return Err("replacement_expired"); }
+    if conditional_account.owner != Some(*PHOENIX_PROGRAM_ID) || conditional_account.executable {
+        return Err("conditional_account_invalid");
+    }
+    let collection = ConditionalOrderCollection::try_from_account_bytes(&conditional_account.data).map_err(|_| "conditional_account_invalid")?;
+    let orders: Vec<_> = collection.active_orders().filter(|(_, o)| o.asset_id == market.asset_id).collect();
+    if collection.header.trader_key != trader || orders.is_empty() || orders.len() > 3
+        || orders.iter().map(|(i, o)| (*i, o.sequence_number)).collect::<Vec<_>>() != plan.conditionals {
+        return Err("conditional_inventory_changed");
+    }
+    let long = plan.signed_base_lots > 0;
+    let old = orders.iter().find(|(i, o)| (*i, o.sequence_number) == plan.old_stop).ok_or("owned_stop_missing")?.1;
+    let (trigger, opposite) = if long { (&old.less_trigger_order, &old.greater_trigger_order) }
+        else { (&old.greater_trigger_order, &old.less_trigger_order) };
+    if !trigger.is_active || opposite.is_active || !old.use_percent || old.percent != 100
+        || trigger.position_sequence_number != plan.position_sequence || trigger.order_kind != StopLossOrderKind::IOC
+        || trigger.trade_side != if long { StopLossTradeSide::Ask } else { StopLossTradeSide::Bid }
+        || trigger.execution_direction != if long { StopLossDirection::LessThan } else { StopLossDirection::GreaterThan }
+        || orders.iter().filter(|(_, o)| if long { o.less_trigger_order.is_active } else { o.greater_trigger_order.is_active }).count() != 1 {
+        return Err("owned_full_stop_required");
+    }
+    let builder = PhoenixTxBuilder::new(metadata);
+    let calc = builder.order_ticket_metadata(&plan.symbol).map_err(|_| "market_unknown")?.market_calc;
+    let ticks = |p: f64| -> Result<u64, &'static str> {
+        if !p.is_finite() || p <= 0.0 { return Err("replacement_geometry_invalid"); }
+        let t = calc.price_to_ticks(p).map_err(|_| "replacement_geometry_invalid")?.as_inner();
+        if t == 0 || t == u64::MAX { return Err("replacement_geometry_invalid"); } Ok(t)
+    };
+    let stop = ticks(plan.trigger_price)?;
+    let execution = ticks(plan.execution_price)?;
+    if (long && (stop < trigger.trigger_price.as_inner() || execution > stop))
+        || (!long && (stop > trigger.trigger_price.as_inner() || execution < stop))
+        || u128::from(stop.abs_diff(execution)) * 100 > u128::from(stop) {
+        return Err("replacement_geometry_invalid");
+    }
+    let params = CancelConditionalOrderParams::builder().trader_account(trader).position_authority(delegate)
+        .orderbook(Pubkey::from_str(&market.market_pubkey).map_err(|_| "market_invalid")?)
+        .conditional_order_index(plan.old_stop.0).disable_first(true).disable_second(true)
+        .build().map_err(|_| "replacement_build_failed")?;
+    let mut ixs = vec![create_cancel_conditional_order_ix(params).map_err(|_| "replacement_build_failed")?.into()];
+    ixs.extend(builder.build_bracket_leg_orders(delegate, trader, &plan.symbol,
+        if long { Side::Bid } else { Side::Ask }, &BracketLegOrders {
+            stop_loss: Some(BracketLeg::new(plan.trigger_price).with_ioc_order().with_execution_price(plan.execution_price)
+                .with_size(BracketLegSize::PositionPercent(100))), take_profit: None,
+        }).map_err(|_| "replacement_build_failed")?);
+    Ok(ixs)
+}
+
 // Pure decoding boundary exercised with retained local VM bytes. This function
 // does not fetch data, sign, submit, or activate a runtime path.
 pub fn project_state(
@@ -299,12 +377,21 @@ pub fn project_state(
             .map(|(index, order)| json!({"index": index, "order": order})).collect::<Vec<_>>()
     } else { Vec::new() };
     let calc = metadata.get_market_calculator(symbol).ok_or("market_unknown")?;
+    let last = book.header.trade_list.iter().max_by_key(|t| t.trade_sequence_number).filter(|t|
+        t.slot > 0 && t.timestamp > 0 && t.trade_sequence_number.checked_add(1) == Some(book.header.trade_sequence_number.sequence_number)
+        && t.slot == book.header.trade_sequence_number.last_update_slot && t.maker_fill.price > 0)
+        .map(|t| (calc.ticks_to_price(t.maker_fill.price.into()), t.slot, t.timestamp))
+        .filter(|(price, _, _)| price.is_finite() && *price > 0.0);
     Ok(json!({
         "symbol": symbol, "asset_id": market.asset_id, "market_status": market.market_status,
         "isolated_only": market.isolated_only, "base_lots_decimals": market.base_lots_decimals,
         "quote_lot_decimals": calc.quote_lot_decimals,
         "margin_admission": "native_simulation_required",
         "tick_size": market.tick_size, "leverage_tiers": market.leverage_tiers, "taker_fee": market.taker_fee,
+        "default_taker_fee_micro": book.header.default_taker_fee_micro,
+        "price_source": "phoenix_orderbook_last_trade",
+        "last_trade_price": last.map(|t| t.0), "last_trade_slot": last.map(|t| t.1),
+        "last_trade_timestamp": last.map(|t| t.2),
         "best_bid": book.bids.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
         "best_ask": book.asks.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
         "signed_base_lots": position.map(|row| row.position.base_lot_position.as_inner()).unwrap_or(0),
@@ -343,13 +430,15 @@ pub fn preparation_context(request: &Request, prepared: &Value) -> Result<Vec<u8
         state: &'a Option<String>,
         entry: &'a Option<EntryPlan>,
         close: &'a Option<ClosePlan>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replace_stop: &'a Option<ReplaceStopPlan>,
         prepared: Value,
     }
     let mut fields = prepared.clone();
     fields.as_object_mut().ok_or("prepared_transaction_invalid")?.remove("binding_signature");
     serde_json::to_vec(&Context {domain:"upscalp-phoenix-prepared-v1", wallet:&request.wallet_address,
         genesis:&request.genesis_hash, state:&request.expected_state_sha256,
-        entry:&request.entry, close:&request.close, prepared:fields})
+        entry:&request.entry, close:&request.close, replace_stop:&request.replace_stop, prepared:fields})
         .map_err(|_| "prepared_context_invalid")
 }
 
@@ -372,6 +461,11 @@ pub fn validate_prepared(request: &Request, delegate: Pubkey) -> Result<Transact
     if !signatures[1].verify(delegate.as_ref(), &preparation_context(request, prepared)?) {
         return Err("prepared_context_invalid");
     }
+    if request.replace_stop.is_some() {
+        let before = prepared.get("replace_before").ok_or("prepared_context_invalid")?;
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(before).map_err(|_| "prepared_context_invalid")?));
+        if request.expected_state_sha256.as_deref() != Some(hash.as_str()) { return Err("prepared_context_invalid"); }
+    }
     Ok(tx)
 }
 
@@ -384,6 +478,133 @@ pub fn project_submission(signature: &str, finalized: bool, failed: bool,
         "submission_state":if finalized { if failed { "failed" } else { "finalized" } } else { "pending" },
         "confirmation_slot":if finalized { Some(transaction_slot) } else { None },
         "send_attempted":false}))
+}
+
+// Decode executed events only after the RPC transaction bytes and slot bind to
+// the original receipt. Missing/truncated events remain explicitly unavailable.
+pub fn project_execution(metadata: &PhoenixMetadata, owner: Pubkey, delegate: Pubkey,
+    plan: &EntryPlan, tx: &Transaction, transaction_slot: u64, record: &Value) -> Result<Value, &'static str> {
+    use phoenix_rise::core::events::{RpcInstructionView, RpcInnerInstructionView, RpcInnerInstructionGroup,
+        parse_events_from_rpc_instructions_with_errors};
+    use phoenix_rise::events::MarketEvent;
+    let fail = "execution_evidence_unavailable";
+    let bytes = STANDARD.decode(record["transaction"][0].as_str().ok_or(fail)?).map_err(|_| fail)?;
+    if record["transaction"][1] != "base64" || bincode::serialize(tx).map_err(|_| fail)? != bytes
+        || record["slot"].as_u64() != Some(transaction_slot) || transaction_slot == 0
+        || record["meta"].get("err") != Some(&Value::Null) || tx.verify().is_err() {
+        return Err(fail);
+    }
+    let fee = record["meta"]["fee"].as_u64().ok_or(fail)?;
+    let account_key = |index: u64| tx.message.account_keys.get(usize::try_from(index).map_err(|_| fail)?).ok_or(fail);
+    let outer = tx.message.instructions.iter().map(|ix| Ok(RpcInstructionView {
+        program_id: account_key(u64::from(ix.program_id_index))?.as_ref(), data:&ix.data,
+    })).collect::<Result<Vec<_>, &'static str>>()?;
+    let groups = record["meta"]["innerInstructions"].as_array().ok_or(fail)?;
+    let mut decoded = Vec::new();
+    let mut indices = Vec::new();
+    for group in groups {
+        let index = u8::try_from(group["index"].as_u64().ok_or(fail)?).map_err(|_| fail)?;
+        if usize::from(index) >= outer.len() || indices.contains(&index) { return Err(fail); }
+        indices.push(index);
+        let mut instructions = Vec::new();
+        for ix in group["instructions"].as_array().ok_or(fail)? {
+            let program = account_key(ix["programIdIndex"].as_u64().ok_or(fail)?)?;
+            // Reuse the installed RPC client's base58 byte decoder; no new crate.
+            let encoded = solana_rpc_client::api::filter::Memcmp::new(0,
+                solana_rpc_client::api::filter::MemcmpEncodedBytes::Base58(ix["data"].as_str().ok_or(fail)?.to_owned()));
+            let data = encoded.bytes().ok_or(fail)?.into_owned();
+            let height = u32::try_from(ix["stackHeight"].as_u64().ok_or(fail)?).map_err(|_| fail)?;
+            if height < 2 { return Err(fail); }
+            instructions.push((program, data, height));
+        }
+        decoded.push(instructions);
+    }
+    let views: Vec<Vec<_>> = decoded.iter().map(|g| g.iter().map(|(program, data, height)|
+        RpcInnerInstructionView {program_id:program.as_ref(), data, stack_height:Some(*height)}).collect()).collect();
+    let groups: Vec<_> = indices.iter().zip(&views).map(|(index, instructions)|
+        RpcInnerInstructionGroup {index:*index, instructions}).collect();
+    let parsed = parse_events_from_rpc_instructions_with_errors(&outer, &groups, PHOENIX_PROGRAM_ID.as_ref());
+    if !parsed.orphan_logs.is_empty() || parsed.instructions.iter().any(|i| !i.failures.is_empty() || !i.skipped_event_bytes.is_empty()) {
+        return Err(fail);
+    }
+    let market = metadata.get_market(&plan.symbol).ok_or(fail)?;
+    let calc = metadata.get_market_calculator(&plan.symbol).ok_or(fail)?;
+    let trader = TraderKey::new(owner).pda();
+    let mut summaries = Vec::new();
+    for instruction in &parsed.instructions {
+        let packet_matches = instruction.events.iter().any(|event| match event {
+            MarketEvent::OrderPacket(e) if e.trader == trader.to_bytes() => match e.order_packet.kind() {
+                phoenix_rise::events::market_events::OrderPacketKind::ImmediateOrCancel {client_order_id, ..} =>
+                    u128::from_le_bytes(*client_order_id) == plan.client_order_id,
+                _ => false,
+            }, _ => false,
+        });
+        if !packet_matches { continue; }
+        let headers: Vec<_> = instruction.events.iter().filter_map(|e| if let MarketEvent::Header(h) = e {Some(h)} else {None}).collect();
+        if headers.len() != 1 || headers[0].trader_account != trader.to_bytes() || headers[0].signer != delegate.to_bytes()
+            || headers[0].asset_id != market.asset_id || headers[0].base_lot_decimals != market.base_lots_decimals
+            || headers[0].quote_lot_decimals != calc.quote_lot_decimals
+            || u64::from(headers[0].tick_size) != market.tick_size { return Err(fail); }
+        for event in &instruction.events {
+            if let MarketEvent::TradeSummary(e) = event {
+                if e.trader != trader.to_bytes() { return Err(fail); }
+                summaries.push(e);
+            }
+        }
+    }
+    if summaries.len() != 1 { return Err(fail); }
+    let summary = summaries[0];
+    let base = summary.base_lots_filled.as_inner();
+    let quote = summary.quote_lots_filled.as_inner();
+    let signed = summary.base_lot_position.as_inner();
+    if base == 0 || base != plan.base_lots || signed.unsigned_abs() != base
+        || !matches!(plan.direction.as_str(), "LONG" | "SHORT") || (signed > 0) != (plan.direction == "LONG")
+        || (summary.side == phoenix_rise::events::market_events::Side::Bid) != (plan.direction == "LONG")
+        || quote == 0 || quote > plan.max_quote_lots { return Err(fail); }
+    let quote_scale = 10_f64.powi(i32::from(calc.quote_lot_decimals));
+    let average = (quote as f64 / quote_scale) / (base as f64 / 10_f64.powi(i32::from(market.base_lots_decimals)));
+    let fee_quote = summary.fee_in_quote_lots.as_inner() as f64 / quote_scale;
+    if !average.is_finite() || average <= 0.0 || !fee_quote.is_finite() || fee_quote < 0.0 { return Err(fail); }
+    Ok(json!({"status":"verified", "source":"phoenix_finalized_transaction_events", "signature":tx.signatures[0].to_string(),
+        "slot":transaction_slot, "client_order_id":plan.client_order_id.to_string(), "signed_base_lots":signed,
+        "base_lots_filled":base, "quote_lots_filled":quote, "fee_quote_lots":summary.fee_in_quote_lots.as_inner(),
+        "average_price":average, "fee_quote":fee_quote, "fee_lamports":fee}))
+}
+
+pub fn project_replacement(metadata: &PhoenixMetadata, plan: &ReplaceStopPlan,
+    before: &Value, after: &Value) -> Result<Value, &'static str> {
+    let fail = "replacement_unverified";
+    if before["symbol"] != plan.symbol || after["symbol"] != plan.symbol
+        || before["signed_base_lots"].as_i64() != Some(plan.signed_base_lots)
+        || after["signed_base_lots"] != before["signed_base_lots"]
+        || before["position_sequence"].as_u64() != Some(u64::from(plan.position_sequence))
+        || after["position_sequence"] != before["position_sequence"] { return Err(fail); }
+    let old = before["conditionals"].as_array().ok_or(fail)?;
+    let current = after["conditionals"].as_array().ok_or(fail)?;
+    let identity = |v: &Value| -> Option<(u8, u64)> { Some((u8::try_from(v["index"].as_u64()?).ok()?, v["order"]["sequence_number"].as_u64()?)) };
+    if old.iter().map(identity).collect::<Option<Vec<_>>>().ok_or(fail)? != plan.conditionals
+        || old.len() != current.len() || current.iter().any(|o| identity(o) == Some(plan.old_stop)) { return Err(fail); }
+    let preserved: Vec<_> = old.iter().filter(|o| identity(o) != Some(plan.old_stop)).collect();
+    if preserved.len() + 1 != old.len() || preserved.iter().any(|o| current.iter().filter(|v| *v == *o).count() != 1) { return Err(fail); }
+    let added: Vec<_> = current.iter().filter(|v| !preserved.contains(v)).collect();
+    if added.len() != 1 { return Err(fail); }
+    let new = added[0];
+    let order = &new["order"];
+    let long = plan.signed_base_lots > 0;
+    let (trigger, opposite) = if long {(&order["less_trigger_order"], &order["greater_trigger_order"])}
+        else {(&order["greater_trigger_order"], &order["less_trigger_order"])};
+    let calc = metadata.get_market_calculator(&plan.symbol).ok_or(fail)?;
+    let stop = calc.price_to_ticks(plan.trigger_price).map_err(|_| fail)?.as_inner();
+    let execution = calc.price_to_ticks(plan.execution_price).map_err(|_| fail)?.as_inner();
+    if order["is_active"] != true || order["use_percent"] != true || order["percent"] != 100
+        || trigger["is_active"] != true || opposite["is_active"] != false
+        || order["asset_id"] != metadata.get_market(&plan.symbol).ok_or(fail)?.asset_id
+        || trigger["position_sequence_number"] != plan.position_sequence || trigger["order_kind"] != json!(StopLossOrderKind::IOC)
+        || trigger["trade_side"] != json!(if long {StopLossTradeSide::Ask} else {StopLossTradeSide::Bid})
+        || trigger["execution_direction"] != json!(if long {StopLossDirection::LessThan} else {StopLossDirection::GreaterThan})
+        || trigger["trigger_price"] != stop.to_string() || trigger["execution_price"] != execution.to_string() { return Err(fail); }
+    Ok(json!({"status":"verified", "old_stop":plan.old_stop, "new_stop":identity(new).ok_or(fail)?,
+        "trigger_ticks":stop, "execution_ticks":execution, "remaining_base_lots":plan.signed_base_lots.unsigned_abs()}))
 }
 
 // The caller persists the signature before invocation and reconciles uncertainty.
@@ -456,6 +677,24 @@ fn run(request: Request) -> Result<Value, &'static str> {
             observed.as_ref().is_some_and(|s| s.err.is_some()), observed.as_ref().map(|s| s.slot).unwrap_or(0), snapshot.context.slot)?;
         result.as_object_mut().unwrap().extend(status.as_object().unwrap().clone());
         result["transaction_sha256"] = request.prepared.as_ref().unwrap()["transaction_sha256"].clone();
+        if let Some(plan) = &request.entry {
+            result["execution"] = json!({"status":"unavailable", "reason":"transaction_not_finalized"});
+            if result["submission_state"] == "finalized" {
+                let record = rpc.send::<Value>(solana_rpc_client::api::request::RpcRequest::GetTransaction,
+                    json!([tx.signatures[0].to_string(), {"encoding":"base64", "commitment":"finalized", "maxSupportedTransactionVersion":0}]));
+                result["execution"] = record.map_err(|_| "execution_evidence_unavailable").and_then(|record|
+                    project_execution(&metadata, owner, signer.pubkey(), plan, tx, observed.as_ref().unwrap().slot, &record))
+                    .unwrap_or_else(|reason| json!({"status":"unavailable", "reason":reason}));
+            }
+        }
+        if let Some(plan) = &request.replace_stop {
+            result["replacement"] = json!({"status":"unverified"});
+            if result["submission_state"] == "finalized" {
+                result["replacement"] = project_replacement(&metadata, plan,
+                    &request.prepared.as_ref().unwrap()["replace_before"], &result["state"])
+                    .unwrap_or_else(|_| json!({"status":"unverified"}));
+            }
+        }
         // Known signatures are never sent again, regardless of confirmation level.
         if observed.is_some() || request.operation == "read_submission" { return Ok(result); }
     }
@@ -463,6 +702,9 @@ fn run(request: Request) -> Result<Value, &'static str> {
     let ixs = if request.entry.is_some() {
         runtime.block_on(build_protected_entry(&metadata, owner, signer.pubkey(), trader_account,
             conditional_account, snapshot.context.slot, request.entry.as_ref().ok_or("entry_required")?))?
+    } else if let Some(plan) = &request.replace_stop {
+        build_replace_stop(&metadata, owner, signer.pubkey(), trader_account,
+            conditional_account.ok_or("conditional_account_absent")?, snapshot.context.slot, plan)?
     } else {
         runtime.block_on(build_protected_close(&metadata, owner, signer.pubkey(), trader_account,
             conditional_account.ok_or("conditional_account_absent")?, snapshot.context.slot, request.close.as_ref().ok_or("close_required")?))?
@@ -504,6 +746,7 @@ fn run(request: Request) -> Result<Value, &'static str> {
     prepared["simulation_slot"] = json!(simulation.context.slot);
     prepared["last_valid_block_height"] = json!(last_valid_block_height);
     prepared["blockhash"] = json!(blockhash.to_string());
+    if request.replace_stop.is_some() { prepared["replace_before"] = result["state"].clone(); }
     prepared["binding_signature"] = json!(signer.sign_message(&preparation_context(&request, &prepared)?).to_string());
     result["prepared"] = prepared;
     // Preparation only. Submission belongs to the separately gated account flow.

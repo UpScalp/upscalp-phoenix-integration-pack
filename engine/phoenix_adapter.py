@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -44,6 +45,8 @@ class PhoenixNativeResult(TypedDict, total=False):
     confirmation_slot: int | None
     send_attempted: bool
     transport_uncertain: bool
+    execution: dict[str, object]
+    replacement: dict[str, object]
 
 
 def phoenix_account_operation(
@@ -54,10 +57,11 @@ def phoenix_account_operation(
     operation = request.get("operation")
     keys = {"validate_connection": {"operation"}, "read_state": {"operation", "symbol"},
             "prepare_entry": {"operation", "entry", "expected_state_sha256"},
-            "prepare_close": {"operation", "close", "expected_state_sha256"}}
+            "prepare_close": {"operation", "close", "expected_state_sha256"},
+            "prepare_replace_stop": {"operation", "replace_stop", "expected_state_sha256"}}
     if operation in ("read_submission", "submit_prepared"):
         keys[operation] = {"operation", "prepared", "expected_state_sha256",
-                           "entry" if "entry" in request else "close"}
+                           "entry" if "entry" in request else "close" if "close" in request else "replace_stop"}
     if not isinstance(operation, str) or operation not in keys or set(request) != keys[operation]:
         raise ValueError("Phoenix operation inputs are incomplete or unsupported")
     if operation != "validate_connection":
@@ -123,13 +127,26 @@ def phoenix_account_operation(
         raise RuntimeError("Phoenix native account response binding failed")
     if operation != "validate_connection":
         state = result.get("state")
-        plan = request.get("entry", request.get("close", {}))
+        plan = request.get("entry", request.get("close", request.get("replace_stop", {})))
         symbol = request.get("symbol") if operation == "read_state" else plan.get("symbol") if isinstance(plan, Mapping) else None
         if (result.get("operation") != operation or not isinstance(state, dict) or not symbol
             or state.get("symbol") != symbol or type(state.get("signed_base_lots")) is not int
             or not isinstance(state.get("conditionals"), list)
             or not isinstance(result.get("state_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", result["state_sha256"])):
             raise RuntimeError("Phoenix native state binding failed")
+        # Native fraction and raw micro-fee are different units. A missing last
+        # trade is explicit; never substitute a midpoint or invented mark price.
+        if (type(state.get("taker_fee")) not in (int, float) or not math.isfinite(state["taker_fee"]) or state["taker_fee"] < 0
+            or type(state.get("default_taker_fee_micro")) is not int or not 0 <= state["default_taker_fee_micro"] <= 2**32 - 1
+            or state.get("price_source") != "phoenix_orderbook_last_trade"):
+            raise RuntimeError("Phoenix native market units invalid")
+        last = [state.get(k) for k in ("last_trade_price", "last_trade_slot", "last_trade_timestamp")]
+        if any(v is not None for v in last) and not (
+            type(last[0]) in (int, float) and math.isfinite(last[0]) and last[0] > 0
+            and type(last[1]) is int and 0 < last[1] <= result["finalized_slot"]
+            and type(last[2]) is int and 0 < last[2] <= 2**63 - 1
+        ):
+            raise RuntimeError("Phoenix native last trade invalid")
         if operation.startswith("prepare_"):
             prepared = result.get("prepared")
             if not isinstance(prepared, dict) or result["state_sha256"] != request["expected_state_sha256"]:
@@ -147,6 +164,8 @@ def phoenix_account_operation(
                 valid = False
             if not valid:
                 raise RuntimeError("Phoenix prepared bytes binding failed")
+            if "replace_stop" in request and prepared.get("replace_before") != state:
+                raise RuntimeError("Phoenix replacement preimage missing")
         elif operation in ("read_submission", "submit_prepared"):
             prepared = request.get("prepared")
             state_name = result.get("submission_state")
@@ -161,6 +180,42 @@ def phoenix_account_operation(
                 or (state_name == "pending" and slot is not None)
                 or (state_name != "pending" and (type(slot) is not int or not 0 < slot <= result["finalized_slot"]))):
                 raise RuntimeError("Phoenix signature status binding failed")
+            execution = result.get("execution")
+            if "entry" in request:
+                if not isinstance(execution, dict) or execution.get("status") not in {"verified", "unavailable"}:
+                    raise RuntimeError("Phoenix execution evidence missing")
+                if execution["status"] == "unavailable":
+                    if set(execution) != {"status", "reason"} or not isinstance(execution.get("reason"), str) or not re.fullmatch(r"[a-z_]{1,64}", execution["reason"]):
+                        raise RuntimeError("Phoenix execution evidence invalid")
+                elif (state_name != "finalized" or execution.get("source") != "phoenix_finalized_transaction_events"
+                    or execution.get("signature") != prepared["signature"]
+                    or type(execution.get("slot")) is not int or execution["slot"] != slot
+                    or execution.get("client_order_id") != str(plan.get("client_order_id"))
+                    or any(type(execution.get(k)) is not int or not 0 <= execution[k] <= 2**64 - 1
+                           for k in ("base_lots_filled", "quote_lots_filled", "fee_quote_lots", "fee_lamports"))
+                    or execution["base_lots_filled"] != plan.get("base_lots") or execution["base_lots_filled"] == 0
+                    or execution["quote_lots_filled"] == 0 or execution["quote_lots_filled"] > plan.get("max_quote_lots", 0)
+                    or type(execution.get("signed_base_lots")) is not int
+                    or execution["signed_base_lots"] != execution["base_lots_filled"] * (1 if plan.get("direction") == "LONG" else -1)
+                    or any(type(execution.get(k)) not in (int, float) or not math.isfinite(execution[k]) or execution[k] < 0
+                           for k in ("average_price", "fee_quote")) or execution["average_price"] == 0):
+                    raise RuntimeError("Phoenix execution evidence binding failed")
+            replacement = result.get("replacement")
+            if "replace_stop" in request:
+                if not isinstance(replacement, dict) or replacement.get("status") not in {"verified", "unverified"}:
+                    raise RuntimeError("Phoenix replacement evidence missing")
+                if replacement["status"] == "unverified":
+                    if set(replacement) != {"status"}:
+                        raise RuntimeError("Phoenix replacement evidence invalid")
+                elif (state_name != "finalized" or replacement.get("old_stop") != plan.get("old_stop")
+                    or not isinstance(replacement.get("new_stop"), list) or len(replacement["new_stop"]) != 2
+                    or any(type(v) is not int or v < 0 for v in replacement["new_stop"])
+                    or replacement["new_stop"][0] > 255 or replacement["new_stop"][1] > 2**64 - 1
+                    or replacement["new_stop"] == replacement["old_stop"]
+                    or any(type(replacement.get(k)) is not int or not 0 < replacement[k] <= 2**64 - 1
+                           for k in ("trigger_ticks", "execution_ticks", "remaining_base_lots"))
+                    or replacement["remaining_base_lots"] != abs(plan.get("signed_base_lots", 0))):
+                    raise RuntimeError("Phoenix replacement evidence binding failed")
     return result
 
 

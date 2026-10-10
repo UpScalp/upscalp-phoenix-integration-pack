@@ -121,6 +121,7 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
             let mut receipt = native::prepared_transaction(&tx, signer.pubkey()).unwrap();
             receipt["blockhash"] = serde_json::json!(tx.message.recent_blockhash.to_string());
             let context = native::preparation_context(&decode(&wire, id), &receipt).unwrap();
+            assert!(!std::str::from_utf8(&context).unwrap().contains("replace_stop"));
             assert_eq!(context, native::preparation_context(&decode(&wire, id), &receipt).unwrap());
             assert!(std::str::from_utf8(&context).unwrap().contains(&format!("\"client_order_id\":{id},")));
             receipt["binding_signature"] = serde_json::json!(signer.sign_message(&context).to_string());
@@ -164,6 +165,31 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
         assert_eq!(bincode::serialize(&tx).unwrap(),frozen);
     }
     assert!(native::dispatch_prepared_once(&tx, |_| Ok("different".to_owned())).is_err());
+    let before = serde_json::json!({"symbol":"BTC","signed_base_lots":100,"conditionals":[]});
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(&before).unwrap()));
+    let mut replacement = input.clone();
+    replacement.as_object_mut().unwrap().remove("entry");
+    replacement["expected_state_sha256"] = serde_json::json!(hash);
+    replacement["replace_stop"] = serde_json::json!({"symbol":"BTC","signed_base_lots":100,"position_sequence":1,
+        "conditionals":[[0,1]],"old_stop":[0,1],"trigger_price":95.0,"execution_price":94.5,"last_valid_slot":1000});
+    let mut receipt = native::prepared_transaction(&tx,signer.pubkey()).unwrap();
+    receipt["blockhash"] = serde_json::json!(tx.message.recent_blockhash.to_string());
+    receipt["replace_before"] = before;
+    let request: native::Request = serde_json::from_value(replacement.clone()).unwrap();
+    receipt["binding_signature"] = serde_json::json!(signer.sign_message(&native::preparation_context(&request,&receipt).unwrap()).to_string());
+    replacement["prepared"] = receipt;
+    for operation in ["read_submission","submit_prepared"] {
+        replacement["operation"] = serde_json::json!(operation);
+        assert_eq!(native::validate_prepared(&serde_json::from_value(replacement.clone()).unwrap(),signer.pubkey()).unwrap(),tx);
+        let mut bad = replacement.clone(); bad["replace_stop"]["old_stop"] = serde_json::json!([0,2]);
+        assert!(native::validate_prepared(&serde_json::from_value(bad).unwrap(),signer.pubkey()).is_err());
+        let mut bad = replacement.clone(); bad["prepared"]["replace_before"]["signed_base_lots"] = serde_json::json!(99);
+        assert!(native::validate_prepared(&serde_json::from_value(bad).unwrap(),signer.pubkey()).is_err());
+        let mut bad = replacement.clone(); bad["close"] = serde_json::json!({"symbol":"BTC","signed_base_lots":100,
+            "position_sequence":1,"conditionals":[],"limit_price":99.0,"max_quote_lots":500,"client_order_id":123,"last_valid_slot":1000});
+        assert!(serde_json::from_value::<native::Request>(bad).unwrap().operation_symbol().is_err());
+    }
     println!("UPSCALP_STATUS original_plan_bound=true exact_signature=true nonfinal_errors_pending=true stale_snapshot_refused=true io=0 vm=0");
 }
 
@@ -287,7 +313,15 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     let metadata = phoenix_metadata_from_fixture(&ctx.fixture);
     let slot = 1_000;
     ctx.svm.warp_to_slot(slot);
-    let signed_lots = if long { 100 } else { -100 };
+    // Pinned solana-clock Clock layout: slot, epoch-start seconds, epoch,
+    // leader-schedule epoch, Unix seconds (40 bytes). Synthetic VM only.
+    let clock_key = solana_pubkey::Pubkey::from_str("SysvarC1ock11111111111111111111111111111111").unwrap();
+    let mut clock_account = ctx.svm.get_account(&clock_key).unwrap();
+    let mut clock: (u64, i64, u64, u64, i64) = bincode::deserialize(&clock_account.data).unwrap();
+    clock.4 = 1_791_650_000;
+    clock_account.data = bincode::serialize(&clock).unwrap();
+    ctx.svm.set_account(clock_key, clock_account).unwrap();
+    let mut signed_lots = if long { 100 } else { -100 };
     let plan = native::EntryPlan {
         symbol: "BTC".into(), direction: if long { "LONG" } else { "SHORT" }.into(), base_lots: 100, max_quote_lots: 2_000_000_000,
         reference_price: 100_000.0, limit_price: if long { 101_000.0 } else { 99_000.0 },
@@ -295,7 +329,7 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
         stop_execution_band_pct: 1.0,
         targets: vec![native::Target { price: if long { 102_000.0 } else { 98_000.0 }, base_lots: 40 },
             native::Target { price: if long { 103_000.0 } else { 97_000.0 }, base_lots: 60 }],
-        client_order_id: 123, last_valid_slot: slot + 100,
+        client_order_id: u128::MAX - 7, last_valid_slot: slot + 100,
     };
     for invalid in [
         native::EntryPlan { last_valid_slot: slot, ..plan.clone() },
@@ -326,7 +360,31 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     assert!(ctx.try_send_instructions_with_metadata(broken, &delegate_seed).is_err());
     assert_eq!(data, ctx.account_data(&address));
     assert!(ctx.svm.get_account(&conditional).is_none());
-    ctx.send_instructions(ixs, &delegate_seed, "delegated-entry-and-all-protection");
+    // Execute the exact retained bytes so economics bind to this transaction,
+    // not a rebuilt message or the later position snapshot.
+    let mut executed_tx = tx.clone();
+    executed_tx.try_sign(&[&signer], ctx.svm.latest_blockhash()).unwrap();
+    let receipt = ctx.svm.send_transaction(executed_tx.clone()).unwrap();
+    let inner: Vec<_> = receipt.inner_instructions.iter().enumerate().map(|(index, instructions)|
+        serde_json::json!({"index":index, "instructions":instructions.iter().map(|ix|
+            serde_json::json!({"programIdIndex":ix.instruction.program_id_index,
+                "data":serde_json::to_value(solana_rpc_client::api::filter::Memcmp::new_base58_encoded(0, &ix.instruction.data)).unwrap()["bytes"],
+                "stackHeight":ix.stack_height})).collect::<Vec<_>>()})).collect();
+    let record = serde_json::json!({"slot":slot, "transaction":[STANDARD.encode(bincode::serialize(&executed_tx).unwrap()),"base64"],
+        "meta":{"err":null,"fee":receipt.fee,"innerInstructions":inner}});
+    let execution = native::project_execution(&metadata, owner, delegate, &plan, &executed_tx, slot, &record).unwrap();
+    assert_eq!(execution["base_lots_filled"], 100);
+    assert_eq!(execution["signed_base_lots"], signed_lots);
+    assert!(execution["average_price"].as_f64().unwrap() > 0.0);
+    assert_eq!(execution["fee_lamports"], receipt.fee);
+    for (key, value) in [("slot", serde_json::json!(slot+1)), ("transaction",serde_json::json!(["wrong","base64"]))] {
+        let mut bad = record.clone(); bad[key] = value;
+        assert!(native::project_execution(&metadata, owner, delegate, &plan, &executed_tx, slot, &bad).is_err());
+    }
+    let mut no_events = record.clone(); no_events["meta"]["innerInstructions"] = serde_json::json!([]);
+    assert!(native::project_execution(&metadata, owner, delegate, &plan, &executed_tx, slot, &no_events).is_err());
+    let wrong_plan = native::EntryPlan {client_order_id:plan.client_order_id+1, ..plan.clone()};
+    assert!(native::project_execution(&metadata, owner, delegate, &wrong_plan, &executed_tx, slot, &record).is_err());
     let state = Trader::try_from_account_bytes(&ctx.account_data(&address)).unwrap();
     assert_eq!(state.position_entries().find(|row| row.asset_id == 0).unwrap().position.base_lot_position.as_inner(), signed_lots);
     let collection = ConditionalOrderCollection::try_from_account_bytes(&ctx.account_data(&conditional)).unwrap();
@@ -368,11 +426,85 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     assert_eq!(projection["signed_base_lots"], signed_lots);
     assert_eq!(projection["conditionals"].as_array().unwrap().len(), 3);
     assert_eq!(projection["nonzero_position_count"], 1);
+    assert_eq!(projection["taker_fee"], metadata.get_market("BTC").unwrap().taker_fee);
+    assert_eq!(projection["price_source"], "phoenix_orderbook_last_trade");
+    assert_eq!(projection["last_trade_slot"], slot);
+    assert!(projection["last_trade_price"].as_f64().unwrap() > 0.0);
     assert!(native::project_state(&metadata, owner, delegate, "BTC", &current, None,
         &FetchedAccount::new(book_account.data.clone(), owner, false)).is_err());
     let mut wrong_market = metadata.exchange().clone();
     wrong_market.markets.get_mut("BTC").unwrap().tick_size += 1;
     assert!(native::project_state(&PhoenixMetadata::new(wrong_market), owner, delegate, "BTC", &current, None, &book_account).is_err());
+    if removed == 0 {
+        let conditional_account = FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false);
+        let old_stop = collection.active_orders().find(|(_, o)| o.use_percent).map(|(i,o)| (i,o.sequence_number)).unwrap();
+        let replace = native::ReplaceStopPlan {symbol:"BTC".into(),signed_base_lots:signed_lots,
+            position_sequence:state.position_entries().find(|p| p.asset_id == 0).unwrap().position.position_sequence_number,
+            conditionals:collection.active_orders().map(|(i,o)| (i,o.sequence_number)).collect(), old_stop,
+            trigger_price:if long {99_000.0} else {101_000.0},execution_price:if long {98_900.0} else {101_100.0},last_valid_slot:slot+100};
+        for bad in [
+            native::ReplaceStopPlan {signed_base_lots:1,..replace.clone()},
+            native::ReplaceStopPlan {position_sequence:replace.position_sequence.wrapping_add(1),..replace.clone()},
+            native::ReplaceStopPlan {old_stop:(7,u64::MAX),..replace.clone()},
+            native::ReplaceStopPlan {conditionals:vec![],..replace.clone()},
+            native::ReplaceStopPlan {last_valid_slot:slot,..replace.clone()},
+            native::ReplaceStopPlan {trigger_price:if long {97_000.0} else {103_000.0},..replace.clone()},
+            native::ReplaceStopPlan {execution_price:if long {95_000.0} else {105_000.0},..replace.clone()},
+            native::ReplaceStopPlan {execution_price:f64::NAN,..replace.clone()},
+        ] {
+            assert!(native::build_replace_stop(&metadata,owner,delegate,&current,&conditional_account,slot,&bad).is_err());
+        }
+        let replacement = native::build_replace_stop(&metadata,owner,delegate,&current,&conditional_account,slot,&replace).unwrap();
+        assert_eq!(replacement.len(),2);
+        let mut broken = replacement.clone(); broken[1].data[0] ^= 0xff;
+        assert!(ctx.try_send_instructions_with_metadata(broken,&delegate_seed).is_err());
+        assert_eq!(ctx.account_data(&conditional), conditional_account.data);
+        assert_eq!(ctx.account_data(&address), current.data);
+        ctx.send_instructions(replacement,&delegate_seed,"atomic-tighten-stop-preserving-targets");
+        let after = native::project_state(&metadata,owner,delegate,"BTC",
+            &FetchedAccount::new(ctx.account_data(&address),*PHOENIX_PROGRAM_ID,false),
+            Some(&FetchedAccount::new(ctx.account_data(&conditional),*PHOENIX_PROGRAM_ID,false)),&book_account).unwrap();
+        let verified = native::project_replacement(&metadata,&replace,&projection,&after).unwrap();
+        assert_eq!(verified["status"],"verified");
+        assert_eq!(verified["remaining_base_lots"],100);
+        let current_after = FetchedAccount::new(ctx.account_data(&address),*PHOENIX_PROGRAM_ID,false);
+        let conditional_after = FetchedAccount::new(ctx.account_data(&conditional),*PHOENIX_PROGRAM_ID,false);
+        assert!(native::build_replace_stop(&metadata,owner,delegate,&current_after,&conditional_after,slot,&replace).is_err());
+        let mut drift = after.clone(); drift["signed_base_lots"] = serde_json::json!(signed_lots/2);
+        assert!(native::project_replacement(&metadata,&replace,&projection,&drift).is_err());
+        let mut drift = after.clone(); drift["conditionals"].as_array_mut().unwrap().pop();
+        assert!(native::project_replacement(&metadata,&replace,&projection,&drift).is_err());
+        // A synthetic partial reduction and exact TP1 removal leave 60 lots.
+        // This is replacement coverage, not evidence that a TP filled.
+        let tp1 = collection.active_orders().find(|(_,o)| !o.use_percent && o.max_size.as_inner() == 40).unwrap().0;
+        let partial = phoenix_rise::core::MarketOrderTicket::builder().authority(delegate).trader_account(address)
+            .symbol("BTC").side(if long {phoenix_rise::ix::prelude::Side::Ask} else {phoenix_rise::ix::prelude::Side::Bid})
+            .price(if long {99_000.0} else {101_000.0}).num_base_lots(40).num_quote_lots(2_000_000_000)
+            .min_base_lots_to_fill(40).client_order_id(126).last_valid_slot(slot+100)
+            .self_trade_behavior(phoenix_rise::ix::prelude::SelfTradeBehavior::Abort)
+            .order_flags(phoenix_rise::ix::prelude::OrderFlags::ReduceOnly).cancel_existing(false).build().unwrap();
+        let mut partial_ixs = builder.place_market_order(partial).await.unwrap();
+        partial_ixs.push(create_cancel_conditional_order_ix(CancelConditionalOrderParams::builder()
+            .trader_account(address).position_authority(delegate).orderbook(book_address)
+            .conditional_order_index(tp1).disable_first(true).disable_second(true).build().unwrap()).unwrap().into());
+        ctx.send_instructions(partial_ixs,&delegate_seed,"synthetic-partial-reduction-not-tp-fill");
+        signed_lots = if long {60} else {-60};
+        let partial_account = FetchedAccount::new(ctx.account_data(&address),*PHOENIX_PROGRAM_ID,false);
+        let partial_orders = FetchedAccount::new(ctx.account_data(&conditional),*PHOENIX_PROGRAM_ID,false);
+        let before_partial = native::project_state(&metadata,owner,delegate,"BTC",&partial_account,Some(&partial_orders),&book_account).unwrap();
+        let partial_collection = ConditionalOrderCollection::try_from_account_bytes(&partial_orders.data).unwrap();
+        let partial_plan = native::ReplaceStopPlan {signed_base_lots:signed_lots,
+            conditionals:partial_collection.active_orders().map(|(i,o)| (i,o.sequence_number)).collect(),
+            old_stop:partial_collection.active_orders().find(|(_,o)| o.use_percent).map(|(i,o)| (i,o.sequence_number)).unwrap(),
+            trigger_price:if long {99_500.0} else {100_500.0},execution_price:if long {99_400.0} else {100_600.0},..replace.clone()};
+        let partial_replace = native::build_replace_stop(&metadata,owner,delegate,&partial_account,&partial_orders,slot,&partial_plan).unwrap();
+        ctx.send_instructions(partial_replace,&delegate_seed,"replace-full-remaining-sixty-lots");
+        let after_partial = native::project_state(&metadata,owner,delegate,"BTC",
+            &FetchedAccount::new(ctx.account_data(&address),*PHOENIX_PROGRAM_ID,false),
+            Some(&FetchedAccount::new(ctx.account_data(&conditional),*PHOENIX_PROGRAM_ID,false)),&book_account).unwrap();
+        assert_eq!(native::project_replacement(&metadata,&partial_plan,&before_partial,&after_partial).unwrap()["remaining_base_lots"],60);
+        println!("UPSCALP_MANAGEMENT direction={} execution_verified=true replacement_atomic=true targets_preserved=true drift_refused=true",plan.direction);
+    }
     if removed != 0 {
         let cancellations: Vec<Instruction> = collection.active_orders()
             .filter(|(_, order)| removed == 3 || order.use_percent)
@@ -390,7 +522,7 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     assert_eq!(remaining_position.position.position_sequence_number,
         state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number);
     let collection = ConditionalOrderCollection::try_from_account_bytes(&ctx.account_data(&conditional)).unwrap();
-    assert_eq!(collection.active_orders().count(), 3 - removed);
+    assert_eq!(collection.active_orders().count(), if removed == 0 {2} else {3 - removed});
     let close = native::ClosePlan {
         symbol: "BTC".into(), signed_base_lots: signed_lots,
         position_sequence: state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number,
@@ -430,5 +562,5 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     assert_eq!(closed_projection["signed_base_lots"], 0);
     assert_eq!(closed_projection["conditionals"].as_array().unwrap().len(), 0);
     println!("UPSCALP_NATIVE_CLOSE direction={} removed_before_close={} position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true", plan.direction, removed);
-    println!("UPSCALP_NATIVE_ENTRY direction={} delegated=true signed_filled_lots={} stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", plan.direction, signed_lots, bytes.len());
+    println!("UPSCALP_NATIVE_ENTRY direction={} delegated=true signed_filled_lots={} stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", plan.direction, execution["signed_base_lots"], bytes.len());
 }
