@@ -102,6 +102,46 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
     let mut changed = input.clone(); changed["prepared"]["signature"] = serde_json::json!("wrong");
     assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), signer.pubkey()).is_err());
     assert!(native::validate_prepared(&request, owner).is_err());
+    // Parse the wire request directly: Value itself cannot retain a full u128.
+    for kind in ["entry", "close"] {
+        for id in [123_u128, u64::MAX as u128, u64::MAX as u128 + 1, u128::MAX] {
+            let mut wire = input.clone();
+            wire["operation"] = serde_json::json!(format!("prepare_{kind}"));
+            wire.as_object_mut().unwrap().remove("prepared");
+            if kind == "close" {
+                wire.as_object_mut().unwrap().remove("entry");
+                wire["close"] = serde_json::json!({"symbol":"BTC", "signed_base_lots":100,
+                    "position_sequence":1,"conditionals":[[0,1]],"limit_price":99.0,
+                    "max_quote_lots":500,"client_order_id":123,"last_valid_slot":1000});
+            }
+            let decode = |value: &serde_json::Value, client_id: u128| -> native::Request {
+                serde_json::from_str(&serde_json::to_string(value).unwrap()
+                    .replace("\"client_order_id\":123", &format!("\"client_order_id\":{client_id}"))).unwrap()
+            };
+            let mut receipt = native::prepared_transaction(&tx, signer.pubkey()).unwrap();
+            receipt["blockhash"] = serde_json::json!(tx.message.recent_blockhash.to_string());
+            let context = native::preparation_context(&decode(&wire, id), &receipt).unwrap();
+            assert_eq!(context, native::preparation_context(&decode(&wire, id), &receipt).unwrap());
+            assert!(std::str::from_utf8(&context).unwrap().contains(&format!("\"client_order_id\":{id},")));
+            receipt["binding_signature"] = serde_json::json!(signer.sign_message(&context).to_string());
+            wire["prepared"] = receipt;
+            for operation in ["read_submission", "submit_prepared"] {
+                wire["operation"] = serde_json::json!(operation);
+                assert_eq!(native::validate_prepared(&decode(&wire, id), signer.pubkey()).unwrap(), tx);
+                assert!(native::validate_prepared(&decode(&wire, id - 1), signer.pubkey()).is_err());
+                for (key, value) in [("expected_state_sha256",serde_json::json!("b".repeat(64))),
+                    ("wallet_address",serde_json::json!(signer.pubkey().to_string())),
+                    ("genesis_hash",serde_json::json!("other"))] {
+                    let mut changed = wire.clone(); changed[key] = value;
+                    assert!(native::validate_prepared(&decode(&changed, id), signer.pubkey()).is_err());
+                }
+                let mut changed = wire.clone(); changed[kind]["last_valid_slot"] = serde_json::json!(1001);
+                assert!(native::validate_prepared(&decode(&changed, id), signer.pubkey()).is_err());
+                let mut changed = wire.clone(); changed["prepared"]["signature"] = serde_json::json!("wrong");
+                assert!(native::validate_prepared(&decode(&changed, id), signer.pubkey()).is_err());
+            }
+        }
+    }
     let signature = tx.signatures[0].to_string();
     for (finalized,failed,slot,want) in [(false,false,0,"pending"),(false,true,8,"pending"),
         (true,false,8,"finalized"),(true,true,8,"failed")] {

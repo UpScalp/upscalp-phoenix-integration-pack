@@ -334,11 +334,22 @@ pub fn prepared_transaction(tx: &Transaction, delegate: Pubkey) -> Result<Value,
 // Status readback must remain tied to the original plan, not just the market.
 // The detached preparation receipt is not a submitted transaction.
 pub fn preparation_context(request: &Request, prepared: &Value) -> Result<Vec<u8>, &'static str> {
+    // Serialize typed plans directly: Value's number range excludes full u128 IDs.
+    #[derive(Serialize)]
+    struct Context<'a> {
+        domain: &'static str,
+        wallet: &'a str,
+        genesis: &'a str,
+        state: &'a Option<String>,
+        entry: &'a Option<EntryPlan>,
+        close: &'a Option<ClosePlan>,
+        prepared: Value,
+    }
     let mut fields = prepared.clone();
     fields.as_object_mut().ok_or("prepared_transaction_invalid")?.remove("binding_signature");
-    serde_json::to_vec(&json!({"domain":"upscalp-phoenix-prepared-v1", "wallet":request.wallet_address,
-        "genesis":request.genesis_hash, "state":request.expected_state_sha256,
-        "entry":request.entry, "close":request.close, "prepared":fields}))
+    serde_json::to_vec(&Context {domain:"upscalp-phoenix-prepared-v1", wallet:&request.wallet_address,
+        genesis:&request.genesis_hash, state:&request.expected_state_sha256,
+        entry:&request.entry, close:&request.close, prepared:fields})
         .map_err(|_| "prepared_context_invalid")
 }
 
