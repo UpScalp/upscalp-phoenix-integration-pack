@@ -55,6 +55,15 @@ fn native_connection_binds_dedicated_delegate_and_program_account() {
 
 #[tokio::test]
 async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
+    delegated_protected_lifecycle(true).await;
+}
+
+#[tokio::test]
+async fn delegated_short_is_atomic_with_full_stop_and_exact_split_targets() {
+    delegated_protected_lifecycle(false).await;
+}
+
+async fn delegated_protected_lifecycle(long: bool) {
     let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
     let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
     ctx.execute_setup();
@@ -70,19 +79,22 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     let metadata = phoenix_metadata_from_fixture(&ctx.fixture);
     let slot = 1_000;
     ctx.svm.warp_to_slot(slot);
+    let signed_lots = if long { 100 } else { -100 };
     let plan = native::EntryPlan {
-        symbol: "BTC".into(), direction: "LONG".into(), base_lots: 100, max_quote_lots: 2_000_000_000,
-        reference_price: 100_000.0, limit_price: 101_000.0, stop_price: 98_000.0, stop_execution_price: 97_900.0,
-        targets: vec![native::Target { price: 102_000.0, base_lots: 40 }, native::Target { price: 103_000.0, base_lots: 60 }],
+        symbol: "BTC".into(), direction: if long { "LONG" } else { "SHORT" }.into(), base_lots: 100, max_quote_lots: 2_000_000_000,
+        reference_price: 100_000.0, limit_price: if long { 101_000.0 } else { 99_000.0 },
+        stop_price: if long { 98_000.0 } else { 102_000.0 }, stop_execution_price: if long { 97_900.0 } else { 102_100.0 },
+        targets: vec![native::Target { price: if long { 102_000.0 } else { 98_000.0 }, base_lots: 40 },
+            native::Target { price: if long { 103_000.0 } else { 97_000.0 }, base_lots: 60 }],
         client_order_id: 123, last_valid_slot: slot + 100,
     };
     for invalid in [
         native::EntryPlan { last_valid_slot: slot, ..plan.clone() },
         native::EntryPlan { stop_price: f64::NAN, ..plan.clone() },
-        native::EntryPlan { stop_price: 101_000.0, ..plan.clone() },
+        native::EntryPlan { stop_price: if long { 101_000.0 } else { 99_000.0 }, ..plan.clone() },
         native::EntryPlan { base_lots: 99, ..plan.clone() },
-        native::EntryPlan { targets: vec![native::Target { price: 99_000.0, base_lots: 100 }], ..plan.clone() },
-        native::EntryPlan { targets: vec![native::Target { price: 100_500.0, base_lots: 100 }], ..plan.clone() },
+        native::EntryPlan { targets: vec![native::Target { price: if long { 99_000.0 } else { 101_000.0 }, base_lots: 100 }], ..plan.clone() },
+        native::EntryPlan { targets: vec![native::Target { price: if long { 100_500.0 } else { 99_500.0 }, base_lots: 100 }], ..plan.clone() },
     ] {
         assert!(native::build_protected_entry(&metadata, owner, delegate, &account, None, slot, &invalid).await.is_err());
     }
@@ -107,7 +119,7 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     assert!(ctx.svm.get_account(&conditional).is_none());
     ctx.send_instructions(ixs, &delegate_seed, "delegated-entry-and-all-protection");
     let state = Trader::try_from_account_bytes(&ctx.account_data(&address)).unwrap();
-    assert_eq!(state.position_entries().find(|row| row.asset_id == 0).unwrap().position.base_lot_position.as_inner(), 100);
+    assert_eq!(state.position_entries().find(|row| row.asset_id == 0).unwrap().position.base_lot_position.as_inner(), signed_lots);
     let collection = ConditionalOrderCollection::try_from_account_bytes(&ctx.account_data(&conditional)).unwrap();
     let orders: Vec<_> = collection.active_orders().map(|(_, order)| order).collect();
     assert_eq!(orders.len(), 3);
@@ -118,20 +130,25 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     let builder = PhoenixTxBuilder::new(&metadata);
     let calc = builder.order_ticket_metadata("BTC").unwrap().market_calc;
     let stop = orders.iter().find(|order| order.use_percent).unwrap();
-    assert!(stop.less_trigger_order.is_active);
-    assert_eq!(stop.less_trigger_order.trigger_price, calc.price_to_ticks(plan.stop_price).unwrap());
-    assert_eq!(stop.less_trigger_order.execution_price, calc.price_to_ticks(plan.stop_execution_price).unwrap());
-    assert_eq!(stop.less_trigger_order.order_kind, StopLossOrderKind::IOC);
-    assert_eq!(stop.less_trigger_order.trade_side, StopLossTradeSide::Ask);
-    assert_eq!(stop.less_trigger_order.execution_direction, StopLossDirection::LessThan);
+    let exit_side = if long { StopLossTradeSide::Ask } else { StopLossTradeSide::Bid };
+    let stop_trigger = if long { &stop.less_trigger_order } else { &stop.greater_trigger_order };
+    assert!(stop_trigger.is_active);
+    assert!(!(if long { &stop.greater_trigger_order } else { &stop.less_trigger_order }).is_active);
+    assert_eq!(stop_trigger.trigger_price, calc.price_to_ticks(plan.stop_price).unwrap());
+    assert_eq!(stop_trigger.execution_price, calc.price_to_ticks(plan.stop_execution_price).unwrap());
+    assert_eq!(stop_trigger.order_kind, StopLossOrderKind::IOC);
+    assert_eq!(stop_trigger.trade_side, exit_side);
+    assert_eq!(stop_trigger.execution_direction, if long { StopLossDirection::LessThan } else { StopLossDirection::GreaterThan });
     for target in &plan.targets {
         let order = orders.iter().find(|order| !order.use_percent && order.max_size.as_inner() == target.base_lots).unwrap();
-        assert!(order.greater_trigger_order.is_active);
-        assert_eq!(order.greater_trigger_order.trigger_price, calc.price_to_ticks(target.price).unwrap());
-        assert_eq!(order.greater_trigger_order.execution_price, calc.price_to_ticks(target.price).unwrap());
-        assert_eq!(order.greater_trigger_order.order_kind, StopLossOrderKind::Limit);
-        assert_eq!(order.greater_trigger_order.trade_side, StopLossTradeSide::Ask);
-        assert_eq!(order.greater_trigger_order.execution_direction, StopLossDirection::GreaterThan);
+        let trigger = if long { &order.greater_trigger_order } else { &order.less_trigger_order };
+        assert!(trigger.is_active);
+        assert!(!(if long { &order.less_trigger_order } else { &order.greater_trigger_order }).is_active);
+        assert_eq!(trigger.trigger_price, calc.price_to_ticks(target.price).unwrap());
+        assert_eq!(trigger.execution_price, calc.price_to_ticks(target.price).unwrap());
+        assert_eq!(trigger.order_kind, StopLossOrderKind::Limit);
+        assert_eq!(trigger.trade_side, exit_side);
+        assert_eq!(trigger.execution_direction, if long { StopLossDirection::GreaterThan } else { StopLossDirection::LessThan });
     }
     let current = FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false);
     assert_eq!(native::build_protected_entry(&metadata, owner, delegate, &current, None, slot, &plan).await.unwrap_err(), "existing_position_refused");
@@ -139,7 +156,7 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     let book_account = FetchedAccount::new(ctx.account_data(&book_address), *PHOENIX_PROGRAM_ID, false);
     let projection = native::project_state(&metadata, owner, delegate, "BTC", &current,
         Some(&FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false)), &book_account).unwrap();
-    assert_eq!(projection["signed_base_lots"], 100);
+    assert_eq!(projection["signed_base_lots"], signed_lots);
     assert_eq!(projection["conditionals"].as_array().unwrap().len(), 3);
     assert_eq!(projection["nonzero_position_count"], 1);
     assert!(native::project_state(&metadata, owner, delegate, "BTC", &current, None,
@@ -148,15 +165,15 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     wrong_market.markets.get_mut("BTC").unwrap().tick_size += 1;
     assert!(native::project_state(&PhoenixMetadata::new(wrong_market), owner, delegate, "BTC", &current, None, &book_account).is_err());
     let close = native::ClosePlan {
-        symbol: "BTC".into(), signed_base_lots: 100,
+        symbol: "BTC".into(), signed_base_lots: signed_lots,
         position_sequence: state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number,
         conditionals: collection.active_orders().map(|(index, order)| (index, order.sequence_number)).collect(),
-        limit_price: 99_000.0, max_quote_lots: 2_000_000_000, client_order_id: 124, last_valid_slot: slot + 100,
+        limit_price: if long { 99_000.0 } else { 101_000.0 }, max_quote_lots: 2_000_000_000, client_order_id: 124, last_valid_slot: slot + 100,
     };
     let conditional_data = ctx.account_data(&conditional);
     let conditional_account = FetchedAccount::new(conditional_data.clone(), *PHOENIX_PROGRAM_ID, false);
     for invalid in [
-        native::ClosePlan { signed_base_lots: -100, ..close.clone() },
+        native::ClosePlan { signed_base_lots: -signed_lots, ..close.clone() },
         native::ClosePlan { position_sequence: close.position_sequence.wrapping_add(1), ..close.clone() },
         native::ClosePlan { conditionals: vec![], ..close.clone() },
         native::ClosePlan { conditionals: vec![(close.conditionals[0].0, close.conditionals[0].1 + 1)], ..close.clone() },
@@ -180,6 +197,6 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
         Some(&FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false)), &book_account).unwrap();
     assert_eq!(closed_projection["signed_base_lots"], 0);
     assert_eq!(closed_projection["conditionals"].as_array().unwrap().len(), 0);
-    println!("UPSCALP_NATIVE_CLOSE position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true");
-    println!("UPSCALP_NATIVE_ENTRY delegated=true filled_lots=100 stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", bytes.len());
+    println!("UPSCALP_NATIVE_CLOSE direction={} position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true", plan.direction);
+    println!("UPSCALP_NATIVE_ENTRY direction={} delegated=true signed_filled_lots={} stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", plan.direction, signed_lots, bytes.len());
 }
