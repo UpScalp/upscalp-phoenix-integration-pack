@@ -2,7 +2,8 @@
 // never read a wallet file, environment secret, or default wallet.
 use std::{io::{self, Read}, str::FromStr, time::Duration};
 
-use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Trader}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
+use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Orderbook, Trader}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use solana_commitment_config::CommitmentConfig;
@@ -11,6 +12,8 @@ use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
+use solana_transaction::Transaction;
+use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +219,65 @@ pub async fn build_protected_close(
         ixs.push(create_cancel_conditional_order_ix(params).map_err(|_| "close_build_failed")?.into());
     }
     Ok(ixs)
+}
+
+// Pure decoding boundary exercised with retained local VM bytes. This function
+// does not fetch data, sign, submit, or activate a runtime path.
+pub fn project_state(
+    metadata: &PhoenixMetadata, owner: Pubkey, delegate: Pubkey, symbol: &str,
+    trader_account: &FetchedAccount, conditional_account: Option<&FetchedAccount>,
+    orderbook_account: &FetchedAccount,
+) -> Result<Value, &'static str> {
+    let trader = TraderKey::new(owner).pda();
+    validate_account(owner, delegate, trader, trader_account)?;
+    let market = metadata.get_market(symbol).ok_or("market_unknown")?;
+    if orderbook_account.owner != Some(*PHOENIX_PROGRAM_ID) || orderbook_account.executable {
+        return Err("orderbook_account_invalid");
+    }
+    let book = Orderbook::try_from_account_bytes(&orderbook_account.data).map_err(|_| "orderbook_account_invalid")?;
+    if book.header.asset_id != market.asset_id || book.header.asset_symbol != market.symbol
+        || book.header.base_lots_decimals != market.base_lots_decimals
+        || book.header.tick_size_in_quote_lots_per_base_lot != market.tick_size {
+        return Err("market_metadata_mismatch");
+    }
+    let state = Trader::try_from_account_bytes(&trader_account.data).map_err(|_| "trader_account_invalid")?;
+    let position = state.position_entries().find(|row| row.asset_id == u64::from(market.asset_id));
+    let orders = if let Some(account) = conditional_account {
+        if account.owner != Some(*PHOENIX_PROGRAM_ID) || account.executable { return Err("conditional_account_invalid"); }
+        let collection = ConditionalOrderCollection::try_from_account_bytes(&account.data).map_err(|_| "conditional_account_invalid")?;
+        if collection.header.trader_key != trader { return Err("conditional_account_invalid"); }
+        collection.active_orders().filter(|(_, order)| order.asset_id == market.asset_id)
+            .map(|(index, order)| json!({"index": index, "order": order})).collect::<Vec<_>>()
+    } else { Vec::new() };
+    let calc = metadata.get_market_calculator(symbol).ok_or("market_unknown")?;
+    Ok(json!({
+        "symbol": symbol, "asset_id": market.asset_id, "market_status": market.market_status,
+        "isolated_only": market.isolated_only, "base_lots_decimals": market.base_lots_decimals,
+        "tick_size": market.tick_size, "leverage_tiers": market.leverage_tiers, "taker_fee": market.taker_fee,
+        "best_bid": book.bids.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
+        "best_ask": book.asks.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
+        "signed_base_lots": position.map(|row| row.position.base_lot_position.as_inner()).unwrap_or(0),
+        "position_sequence": position.map(|row| row.position.position_sequence_number),
+        "virtual_quote_lots": position.map(|row| row.position.virtual_quote_lot_position.as_inner()).unwrap_or(0),
+        "quote_lot_collateral": state.state.quote_lot_collateral.as_inner(),
+        "nonzero_position_count": state.position_entries().filter(|row| row.position.base_lot_position.as_inner() != 0).count(),
+        "conditionals": orders
+    }))
+}
+
+// Serialize an already-signed transaction; no signing or submission here.
+pub fn prepared_transaction(tx: &Transaction, delegate: Pubkey) -> Result<Value, &'static str> {
+    if tx.signatures.len() != 1 || tx.message.header.num_required_signatures != 1
+        || tx.message.account_keys.first() != Some(&delegate) || tx.verify().is_err()
+        || tx.message.instructions.is_empty()
+        || tx.message.instructions.iter().any(|ix| tx.message.account_keys.get(usize::from(ix.program_id_index)) != Some(&*PHOENIX_PROGRAM_ID)) {
+        return Err("prepared_transaction_invalid");
+    }
+    let bytes = bincode::serialize(tx).map_err(|_| "prepared_transaction_invalid")?;
+    if bytes.len() > 1232 { return Err("transaction_packet_too_large"); }
+    Ok(json!({"transaction_base64": STANDARD.encode(&bytes), "transaction_sha256": format!("{:x}", Sha256::digest(&bytes)),
+        "signature": tx.signatures[0].to_string(), "instruction_count": tx.message.instructions.len(),
+        "transaction_bytes": bytes.len(), "submitted": false}))
 }
 
 fn run(request: Request) -> Result<Value, &'static str> {

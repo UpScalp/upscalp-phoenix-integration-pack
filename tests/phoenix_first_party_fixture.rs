@@ -5,10 +5,12 @@ mod test_harness;
 #[path = "../examples/upscalp_phoenix_native.rs"]
 mod native;
 
-use phoenix_rise::{accounts::owned::{Trader, ConditionalOrderCollection, StopLossDirection, StopLossOrderKind, StopLossTradeSide}, core::{FetchedAccount, PhoenixTxBuilder}, ix::{PHOENIX_PROGRAM_ID, prelude::{DelegateTraderParams, create_delegate_trader_ix, get_conditional_orders_address}}};
+use phoenix_rise::{accounts::owned::{Trader, ConditionalOrderCollection, StopLossDirection, StopLossOrderKind, StopLossTradeSide}, core::{FetchedAccount, PhoenixTxBuilder, PhoenixMetadata}, ix::{PHOENIX_PROGRAM_ID, prelude::{DelegateTraderParams, create_delegate_trader_ix, get_conditional_orders_address}}};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
+use std::str::FromStr;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use test_harness::{SdkLocalnetContext, default_sdk_localnet_fixture, find_sdk_localnet_program_paths, sdk_localnet_seed_bytes, phoenix_metadata_from_fixture};
 
 #[test]
@@ -89,6 +91,14 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     let tx = solana_transaction::Transaction::new_signed_with_payer(&ixs, Some(&delegate), &[&signer], ctx.svm.latest_blockhash());
     let bytes = bincode::serialize(&tx).unwrap();
     assert!(bytes.len() <= 1232, "transaction exceeds Solana packet: {}", bytes.len());
+    let prepared = native::prepared_transaction(&tx, delegate).unwrap();
+    assert_eq!(STANDARD.decode(prepared["transaction_base64"].as_str().unwrap()).unwrap(), bytes);
+    assert_eq!(prepared["signature"], tx.signatures[0].to_string());
+    assert_eq!(prepared["submitted"], false);
+    assert!(native::prepared_transaction(&tx, owner).is_err());
+    let mut tampered = tx.clone();
+    tampered.message.instructions[0].data[0] ^= 0xff;
+    assert!(native::prepared_transaction(&tampered, delegate).is_err());
     let conditional = get_conditional_orders_address(&address).unwrap();
     let mut broken = ixs.clone();
     broken.last_mut().unwrap().data[0] ^= 0xff;
@@ -125,6 +135,18 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     }
     let current = FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false);
     assert_eq!(native::build_protected_entry(&metadata, owner, delegate, &current, None, slot, &plan).await.unwrap_err(), "existing_position_refused");
+    let book_address = solana_pubkey::Pubkey::from_str(&metadata.get_market("BTC").unwrap().market_pubkey).unwrap();
+    let book_account = FetchedAccount::new(ctx.account_data(&book_address), *PHOENIX_PROGRAM_ID, false);
+    let projection = native::project_state(&metadata, owner, delegate, "BTC", &current,
+        Some(&FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false)), &book_account).unwrap();
+    assert_eq!(projection["signed_base_lots"], 100);
+    assert_eq!(projection["conditionals"].as_array().unwrap().len(), 3);
+    assert_eq!(projection["nonzero_position_count"], 1);
+    assert!(native::project_state(&metadata, owner, delegate, "BTC", &current, None,
+        &FetchedAccount::new(book_account.data.clone(), owner, false)).is_err());
+    let mut wrong_market = metadata.exchange().clone();
+    wrong_market.markets.get_mut("BTC").unwrap().tick_size += 1;
+    assert!(native::project_state(&PhoenixMetadata::new(wrong_market), owner, delegate, "BTC", &current, None, &book_account).is_err());
     let close = native::ClosePlan {
         symbol: "BTC".into(), signed_base_lots: 100,
         position_sequence: state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number,
@@ -153,6 +175,11 @@ async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
     assert_eq!(closed.position_entries().find(|row| row.asset_id == 0).map(|row| row.position.base_lot_position.as_inner()).unwrap_or(0), 0);
     let after_close = ConditionalOrderCollection::try_from_account_bytes(&ctx.account_data(&conditional)).unwrap();
     assert_eq!(after_close.active_orders().count(), 0);
+    let closed_projection = native::project_state(&metadata, owner, delegate, "BTC",
+        &FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false),
+        Some(&FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false)), &book_account).unwrap();
+    assert_eq!(closed_projection["signed_base_lots"], 0);
+    assert_eq!(closed_projection["conditionals"].as_array().unwrap().len(), 0);
     println!("UPSCALP_NATIVE_CLOSE position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true");
     println!("UPSCALP_NATIVE_ENTRY delegated=true filled_lots=100 stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", bytes.len());
 }
