@@ -146,12 +146,25 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
     let signature = tx.signatures[0].to_string();
     for (finalized,failed,slot,want) in [(false,false,0,"pending"),(false,true,8,"pending"),
         (true,false,8,"finalized"),(true,true,8,"failed")] {
-        let result = native::project_submission(&signature,finalized,failed,slot,9).unwrap();
+        let result = native::project_submission(&signature,Some((finalized,failed,slot)),9,Some((101,100))).unwrap();
         assert_eq!(result["signature"],signature); assert_eq!(result["submission_state"],want);
         assert_eq!(result["send_attempted"],false);
     }
-    assert!(native::project_submission(&signature,true,false,10,9).is_err());
-    assert!(native::project_submission(&signature,true,false,0,9).is_err());
+    assert!(native::project_submission(&signature,Some((true,false,10)),9,None).is_err());
+    assert!(native::project_submission(&signature,Some((true,false,0)),9,None).is_err());
+    for (height,want) in [(99,"pending"),(100,"pending"),(101,"expired")] {
+        let result = native::project_submission(&signature,None,9,Some((height,100))).unwrap();
+        assert_eq!(result["signature"],signature); assert_eq!(result["submission_state"],want);
+        assert!(result["confirmation_slot"].is_null()); assert_eq!(result["send_attempted"],false);
+        if want == "expired" {
+            assert_eq!(result["expiry"],serde_json::json!({"finalized_block_height":101,
+                "last_valid_block_height":100,"history_status_absent":true}));
+        } else { assert!(result.get("expiry").is_none()); }
+    }
+    assert_eq!(native::project_submission(&signature,None,9,None).unwrap()["submission_state"],"pending");
+    for invalid in [(0,100),(101,0)] {
+        assert!(native::project_submission(&signature,None,9,Some(invalid)).is_err());
+    }
     let frozen = bincode::serialize(&tx).unwrap();
     for uncertain in [false,true] {
         let mut calls=0;

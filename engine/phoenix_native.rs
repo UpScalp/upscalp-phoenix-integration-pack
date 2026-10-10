@@ -469,10 +469,22 @@ pub fn validate_prepared(request: &Request, delegate: Pubkey) -> Result<Transact
     Ok(tx)
 }
 
-pub fn project_submission(signature: &str, finalized: bool, failed: bool,
-    transaction_slot: u64, snapshot_slot: u64) -> Result<Value, &'static str> {
+pub fn project_submission(signature: &str, observed: Option<(bool, bool, u64)>,
+    snapshot_slot: u64, block_heights: Option<(u64, u64)>) -> Result<Value, &'static str> {
+    let (finalized, failed, transaction_slot) = observed.unwrap_or((false, false, 0));
     if finalized && (transaction_slot == 0 || snapshot_slot < transaction_slot) {
         return Err("post_transaction_snapshot_stale");
+    }
+    // Heights are finalized current height and the signed preparation's limit.
+    // A known (even nonfinalized) signature cannot be classified as absent.
+    if let Some((height, limit)) = block_heights {
+        if height == 0 || limit == 0 { return Err("block_height_invalid"); }
+        if observed.is_none() && height > limit {
+            return Ok(json!({"signature":signature, "submission_state":"expired",
+                "confirmation_slot":null, "send_attempted":false,
+                "expiry":{"finalized_block_height":height, "last_valid_block_height":limit,
+                    "history_status_absent":true}}));
+        }
     }
     Ok(json!({"signature":signature,
         "submission_state":if finalized { if failed { "failed" } else { "finalized" } } else { "pending" },
@@ -632,7 +644,15 @@ fn run(request: Request) -> Result<Value, &'static str> {
     if genesis.to_string() != request.genesis_hash {
         return Err("rpc_genesis_mismatch");
     }
-    // Read the precise signature before the finalized account snapshot.
+    // Read height first, then history: an earlier absence must not be combined
+    // with a later expiry while a transaction could land between those reads.
+    let block_heights = if supplied_tx.is_some() {
+        let limit = request.prepared.as_ref().unwrap()["last_valid_block_height"].as_u64()
+            .filter(|limit| *limit > 0).ok_or("prepared_block_height_invalid")?;
+        Some((rpc.get_block_height_with_commitment(CommitmentConfig::finalized())
+            .map_err(|_| "block_height_unavailable")?, limit))
+    } else { None };
+    // Read the precise signature with history before the finalized account snapshot.
     let observed = if let Some(tx) = &supplied_tx {
         let statuses = rpc.get_signature_statuses_with_history(&[tx.signatures[0]]).map_err(|_| "signature_status_unavailable")?;
         if statuses.value.len() != 1 { return Err("signature_status_invalid"); }
@@ -673,8 +693,8 @@ fn run(request: Request) -> Result<Value, &'static str> {
             return Err("prepared_market_binding_invalid");
         }
         let status = project_submission(&tx.signatures[0].to_string(),
-            observed.as_ref().is_some_and(|s| s.satisfies_commitment(CommitmentConfig::finalized())),
-            observed.as_ref().is_some_and(|s| s.err.is_some()), observed.as_ref().map(|s| s.slot).unwrap_or(0), snapshot.context.slot)?;
+            observed.as_ref().map(|s| (s.satisfies_commitment(CommitmentConfig::finalized()),
+                s.err.is_some(), s.slot)), snapshot.context.slot, block_heights)?;
         result.as_object_mut().unwrap().extend(status.as_object().unwrap().clone());
         result["transaction_sha256"] = request.prepared.as_ref().unwrap()["transaction_sha256"].clone();
         if let Some(plan) = &request.entry {
@@ -696,7 +716,7 @@ fn run(request: Request) -> Result<Value, &'static str> {
             }
         }
         // Known signatures are never sent again, regardless of confirmation level.
-        if observed.is_some() || request.operation == "read_submission" { return Ok(result); }
+        if observed.is_some() || request.operation == "read_submission" || result["submission_state"] == "expired" { return Ok(result); }
     }
     if request.expected_state_sha256.as_deref() != Some(state_hash.as_str()) { return Err("state_changed"); }
     let ixs = if request.entry.is_some() {
