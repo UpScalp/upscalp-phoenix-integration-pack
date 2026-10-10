@@ -25,6 +25,7 @@ class PhoenixPreparedTransaction(TypedDict):
     simulation_slot: int
     last_valid_block_height: int
     blockhash: str
+    binding_signature: str
 
 
 class PhoenixNativeResult(TypedDict, total=False):
@@ -37,17 +38,26 @@ class PhoenixNativeResult(TypedDict, total=False):
     state_sha256: str
     state: dict[str, object]
     prepared: PhoenixPreparedTransaction
+    signature: str
+    transaction_sha256: str
+    submission_state: str
+    confirmation_slot: int | None
+    send_attempted: bool
+    transport_uncertain: bool
 
 
 def phoenix_account_operation(
     credentials: Mapping[str, str], *, executable: str, executable_sha256: str,
     rpc_url: str, genesis_hash: str, request: Mapping[str, object], api_url: str = "",
 ) -> PhoenixNativeResult:
-    """Bound native read/prepare call. Prepared bytes are never a placement receipt."""
+    """Bound native account operation; activation is gated by the account caller."""
     operation = request.get("operation")
     keys = {"validate_connection": {"operation"}, "read_state": {"operation", "symbol"},
             "prepare_entry": {"operation", "entry", "expected_state_sha256"},
             "prepare_close": {"operation", "close", "expected_state_sha256"}}
+    if operation in ("read_submission", "submit_prepared"):
+        keys[operation] = {"operation", "prepared", "expected_state_sha256",
+                           "entry" if "entry" in request else "close"}
     if not isinstance(operation, str) or operation not in keys or set(request) != keys[operation]:
         raise ValueError("Phoenix operation inputs are incomplete or unsupported")
     if operation != "validate_connection":
@@ -128,6 +138,8 @@ def phoenix_account_operation(
                 raw = base64.b64decode(prepared["transaction_base64"], validate=True)
                 valid = (0 < len(raw) <= 1232 and hashlib.sha256(raw).hexdigest() == prepared["transaction_sha256"]
                          and prepared["submitted"] is False and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{64,88}", prepared["signature"])
+                         and isinstance(prepared.get("binding_signature"), str)
+                         and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{64,88}", prepared["binding_signature"])
                          and all(type(prepared.get(k)) is int and prepared[k] >= 0 for k in ("fee_lamports", "payer_balance_lamports"))
                          and prepared["payer_balance_lamports"] >= prepared["fee_lamports"]
                          and all(type(prepared.get(k)) is int and prepared[k] > 0 for k in ("simulation_slot", "last_valid_block_height")))
@@ -135,6 +147,20 @@ def phoenix_account_operation(
                 valid = False
             if not valid:
                 raise RuntimeError("Phoenix prepared bytes binding failed")
+        elif operation in ("read_submission", "submit_prepared"):
+            prepared = request.get("prepared")
+            state_name = result.get("submission_state")
+            slot = result.get("confirmation_slot")
+            if (not isinstance(prepared, Mapping) or not prepared.get("signature")
+                or result.get("signature") != prepared.get("signature")
+                or result.get("transaction_sha256") != prepared.get("transaction_sha256")
+                or state_name not in {"pending", "finalized", "failed"}
+                or type(result.get("send_attempted")) is not bool
+                or (operation == "read_submission" and result["send_attempted"])
+                or (result["send_attempted"] and (state_name != "pending" or type(result.get("transport_uncertain")) is not bool))
+                or (state_name == "pending" and slot is not None)
+                or (state_name != "pending" and (type(slot) is not int or not 0 < slot <= result["finalized_slot"]))):
+                raise RuntimeError("Phoenix signature status binding failed")
     return result
 
 

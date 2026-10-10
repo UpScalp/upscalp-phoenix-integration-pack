@@ -68,6 +68,66 @@ fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
 }
 
 #[test]
+fn prepared_status_preserves_original_plan_and_finality_without_io() {
+    let signer = Keypair::new_from_array([71; 32]);
+    let owner = Keypair::new_from_array([72; 32]).pubkey();
+    let mut input = serde_json::json!({"operation":"prepare_entry", "wallet_address":owner.to_string(),
+        "private_key":"not-used", "rpc_url":"https://rpc.example.invalid", "genesis_hash":"test",
+        "api_url":"https://metadata.example.invalid", "expected_state_sha256":"a".repeat(64),
+        "entry":{"symbol":"BTC","direction":"LONG","base_lots":100,"max_quote_lots":500,
+            "reference_price":100.0,"limit_price":101.0,"stop_price":90.0,"stop_execution_price":89.1,
+            "stop_execution_band_pct":1.0,"targets":[{"price":110.0,"base_lots":100}],
+            "client_order_id":123,"last_valid_slot":1000}});
+    let request: native::Request = serde_json::from_value(input.clone()).unwrap();
+    let ix = Instruction { program_id:*PHOENIX_PROGRAM_ID, accounts:vec![], data:vec![1] };
+    let mut tx = solana_transaction::Transaction::new_with_payer(&[ix], Some(&signer.pubkey()));
+    tx.try_sign(&[&signer], tx.message.recent_blockhash).unwrap();
+    let mut prepared = native::prepared_transaction(&tx, signer.pubkey()).unwrap();
+    prepared["blockhash"] = serde_json::json!(tx.message.recent_blockhash.to_string());
+    prepared["binding_signature"] = serde_json::json!(signer.sign_message(&native::preparation_context(&request, &prepared).unwrap()).to_string());
+    input["operation"] = serde_json::json!("read_submission");
+    input["prepared"] = prepared;
+    let request: native::Request = serde_json::from_value(input.clone()).unwrap();
+    assert_eq!(native::validate_prepared(&request, signer.pubkey()).unwrap(), tx);
+    for (key, value) in [("base_lots",serde_json::json!(101)),("stop_execution_price",serde_json::json!(88.0)),
+        ("symbol",serde_json::json!("OTHER")),("last_valid_slot",serde_json::json!(1001))] {
+        let mut changed = input.clone(); changed["entry"][key] = value;
+        assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), signer.pubkey()).is_err());
+    }
+    for (key,value) in [("expected_state_sha256",serde_json::json!("b".repeat(64))),
+        ("wallet_address",serde_json::json!(signer.pubkey().to_string())),("genesis_hash",serde_json::json!("other"))] {
+        let mut changed = input.clone(); changed[key] = value;
+        assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), signer.pubkey()).is_err());
+    }
+    let mut changed = input.clone(); changed["prepared"]["signature"] = serde_json::json!("wrong");
+    assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), signer.pubkey()).is_err());
+    assert!(native::validate_prepared(&request, owner).is_err());
+    let signature = tx.signatures[0].to_string();
+    for (finalized,failed,slot,want) in [(false,false,0,"pending"),(false,true,8,"pending"),
+        (true,false,8,"finalized"),(true,true,8,"failed")] {
+        let result = native::project_submission(&signature,finalized,failed,slot,9).unwrap();
+        assert_eq!(result["signature"],signature); assert_eq!(result["submission_state"],want);
+        assert_eq!(result["send_attempted"],false);
+    }
+    assert!(native::project_submission(&signature,true,false,10,9).is_err());
+    assert!(native::project_submission(&signature,true,false,0,9).is_err());
+    let frozen = bincode::serialize(&tx).unwrap();
+    for uncertain in [false,true] {
+        let mut calls=0;
+        let result=native::dispatch_prepared_once(&tx, |original| {
+            calls+=1;
+            assert_eq!(bincode::serialize(original).unwrap(),frozen);
+            if uncertain { Err(()) } else { Ok(signature.clone()) }
+        }).unwrap();
+        assert_eq!(calls,1); assert_eq!(result["submission_state"],"pending");
+        assert_eq!(result["signature"],signature); assert_eq!(result["transport_uncertain"],uncertain);
+        assert_eq!(bincode::serialize(&tx).unwrap(),frozen);
+    }
+    assert!(native::dispatch_prepared_once(&tx, |_| Ok("different".to_owned())).is_err());
+    println!("UPSCALP_STATUS original_plan_bound=true exact_signature=true nonfinal_errors_pending=true stale_snapshot_refused=true io=0 vm=0");
+}
+
+#[test]
 fn native_connection_binds_dedicated_delegate_and_program_account() {
     let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
     let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);

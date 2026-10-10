@@ -4,13 +4,14 @@ use std::{io::{self, Read}, str::FromStr, time::Duration};
 
 use phoenix_rise::{accounts::owned::{ConditionalOrderCollection, Orderbook, Trader}, core::{BracketLeg, BracketLegOrders, BracketLegSize, FetchedAccount, MarketOrderTicket, PhoenixMetadata, PhoenixTxBuilder, TraderKey}, ix::{PHOENIX_PROGRAM_ID, prelude::{OrderFlags, SelfTradeBehavior, Side, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_commitment_config::CommitmentConfig;
 use solana_keypair::Keypair;
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use solana_rpc_client::api::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use sha2::{Digest, Sha256};
@@ -29,21 +30,28 @@ pub struct Request {
     entry: Option<EntryPlan>,
     close: Option<ClosePlan>,
     expected_state_sha256: Option<String>,
+    prepared: Option<Value>,
 }
 
 impl Request {
     // Reject ambiguous operation inputs before any RPC or key use.
     pub fn operation_symbol(&self) -> Result<Option<&str>, &'static str> {
+        let retained = matches!(self.operation.as_str(), "read_submission" | "submit_prepared");
+        if retained != self.prepared.is_some() {
+            return Err("prepared_inputs_invalid");
+        }
         let symbol = match self.operation.as_str() {
             "validate_connection" if self.symbol.is_none() && self.entry.is_none() && self.close.is_none()
                 && self.expected_state_sha256.is_none() && self.api_url.is_none() => return Ok(None),
             "read_state" if self.entry.is_none() && self.close.is_none() && self.expected_state_sha256.is_none() => self.symbol.as_deref(),
             "prepare_entry" if self.symbol.is_none() && self.close.is_none() => self.entry.as_ref().map(|p| p.symbol.as_str()),
             "prepare_close" if self.symbol.is_none() && self.entry.is_none() => self.close.as_ref().map(|p| p.symbol.as_str()),
+            "read_submission" | "submit_prepared" if self.symbol.is_none() && (self.entry.is_some() != self.close.is_some()) =>
+                self.entry.as_ref().map(|p| p.symbol.as_str()).or_else(|| self.close.as_ref().map(|p| p.symbol.as_str())),
             _ => return Err("operation_inputs_invalid"),
         }.filter(|s| !s.is_empty() && s.trim() == *s).ok_or("symbol_required")?;
         if !self.api_url.as_deref().is_some_and(valid_https_endpoint) { return Err("metadata_endpoint_required"); }
-        if self.operation.starts_with("prepare_") && !self.expected_state_sha256.as_deref()
+        if (self.operation.starts_with("prepare_") || retained) && !self.expected_state_sha256.as_deref()
             .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
             return Err("expected_state_required");
         }
@@ -90,14 +98,14 @@ pub fn validate_account(owner: Pubkey, delegate: Pubkey, address: Pubkey, accoun
     }))
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub price: f64,
     pub base_lots: u64,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPlan {
     pub symbol: String,
@@ -197,7 +205,7 @@ pub async fn build_protected_entry(
     Ok(ixs)
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosePlan {
     pub symbol: String,
@@ -294,6 +302,8 @@ pub fn project_state(
     Ok(json!({
         "symbol": symbol, "asset_id": market.asset_id, "market_status": market.market_status,
         "isolated_only": market.isolated_only, "base_lots_decimals": market.base_lots_decimals,
+        "quote_lot_decimals": calc.quote_lot_decimals,
+        "margin_admission": "native_simulation_required",
         "tick_size": market.tick_size, "leverage_tiers": market.leverage_tiers, "taker_fee": market.taker_fee,
         "best_bid": book.bids.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
         "best_ask": book.asks.first().map(|row| calc.ticks_to_price(row.order_id.price_in_ticks)),
@@ -321,17 +331,81 @@ pub fn prepared_transaction(tx: &Transaction, delegate: Pubkey) -> Result<Value,
         "transaction_bytes": bytes.len(), "submitted": false}))
 }
 
+// Status readback must remain tied to the original plan, not just the market.
+// The detached preparation receipt is not a submitted transaction.
+pub fn preparation_context(request: &Request, prepared: &Value) -> Result<Vec<u8>, &'static str> {
+    let mut fields = prepared.clone();
+    fields.as_object_mut().ok_or("prepared_transaction_invalid")?.remove("binding_signature");
+    serde_json::to_vec(&json!({"domain":"upscalp-phoenix-prepared-v1", "wallet":request.wallet_address,
+        "genesis":request.genesis_hash, "state":request.expected_state_sha256,
+        "entry":request.entry, "close":request.close, "prepared":fields}))
+        .map_err(|_| "prepared_context_invalid")
+}
+
+pub fn validate_prepared(request: &Request, delegate: Pubkey) -> Result<Transaction, &'static str> {
+    request.operation_symbol()?;
+    let prepared = request.prepared.as_ref().ok_or("prepared_required")?;
+    let bytes = STANDARD.decode(prepared["transaction_base64"].as_str().ok_or("prepared_transaction_invalid")?)
+        .map_err(|_| "prepared_transaction_invalid")?;
+    if bytes.is_empty() || bytes.len() > 1232 { return Err("prepared_transaction_invalid"); }
+    let tx: Transaction = bincode::deserialize(&bytes).map_err(|_| "prepared_transaction_invalid")?;
+    let canonical = prepared_transaction(&tx, delegate)?;
+    if canonical.as_object().unwrap().iter().any(|(key, value)| prepared.get(key) != Some(value))
+        || prepared["blockhash"].as_str() != Some(tx.message.recent_blockhash.to_string().as_str()) {
+        return Err("prepared_transaction_invalid");
+    }
+    // Infer the installed signature type from the verified transaction; no new dependency.
+    let signature = prepared["binding_signature"].as_str().ok_or("prepared_context_invalid")?
+        .parse().map_err(|_| "prepared_context_invalid")?;
+    let signatures = [tx.signatures[0], signature];
+    if !signatures[1].verify(delegate.as_ref(), &preparation_context(request, prepared)?) {
+        return Err("prepared_context_invalid");
+    }
+    Ok(tx)
+}
+
+pub fn project_submission(signature: &str, finalized: bool, failed: bool,
+    transaction_slot: u64, snapshot_slot: u64) -> Result<Value, &'static str> {
+    if finalized && (transaction_slot == 0 || snapshot_slot < transaction_slot) {
+        return Err("post_transaction_snapshot_stale");
+    }
+    Ok(json!({"signature":signature,
+        "submission_state":if finalized { if failed { "failed" } else { "finalized" } } else { "pending" },
+        "confirmation_slot":if finalized { Some(transaction_slot) } else { None },
+        "send_attempted":false}))
+}
+
+// The caller persists the signature before invocation and reconciles uncertainty.
+pub fn dispatch_prepared_once(tx: &Transaction,
+    send: impl FnOnce(&Transaction) -> Result<String, ()>) -> Result<Value, &'static str> {
+    let signature = tx.signatures.first().ok_or("prepared_transaction_invalid")?.to_string();
+    let response = send(tx);
+    if response.as_ref().is_ok_and(|returned| returned != &signature) {
+        return Err("submission_signature_mismatch");
+    }
+    // A transport error may follow successful submission; it is not failure proof.
+    Ok(json!({"signature":signature,"submission_state":"pending","confirmation_slot":null,
+        "send_attempted":true,"transport_uncertain":response.is_err()}))
+}
+
 fn run(request: Request) -> Result<Value, &'static str> {
     let symbol = request.operation_symbol()?;
     if !valid_https_endpoint(&request.rpc_url) || request.genesis_hash.is_empty() {
         return Err("rpc_identity_required");
     }
     let (owner, signer) = parse_identity(&request.wallet_address, &request.private_key)?;
+    let supplied_tx = if request.prepared.is_some() { Some(validate_prepared(&request, signer.pubkey())?) } else { None };
     let rpc = RpcClient::new_with_timeout_and_commitment(request.rpc_url.clone(), Duration::from_secs(15), CommitmentConfig::finalized());
     let genesis = rpc.get_genesis_hash().map_err(|_| "rpc_unavailable")?;
     if genesis.to_string() != request.genesis_hash {
         return Err("rpc_genesis_mismatch");
     }
+    // Read the precise signature before the finalized account snapshot.
+    let observed = if let Some(tx) = &supplied_tx {
+        let statuses = rpc.get_signature_statuses_with_history(&[tx.signatures[0]]).map_err(|_| "signature_status_unavailable")?;
+        if statuses.value.len() != 1 { return Err("signature_status_invalid"); }
+        statuses.value.into_iter().next().flatten()
+    } else { None };
     let address = TraderKey::new(owner).pda();
     let response = rpc.get_account_with_commitment(&address, CommitmentConfig::finalized()).map_err(|_| "rpc_unavailable")?;
     let account = response.value.ok_or("trader_account_absent")?;
@@ -362,14 +436,45 @@ fn run(request: Request) -> Result<Value, &'static str> {
     result["state"] = state;
     result["state_sha256"] = json!(state_hash);
     if request.operation == "read_state" { return Ok(result); }
+    if let Some(tx) = &supplied_tx {
+        if !tx.message.account_keys.contains(&address) || !tx.message.account_keys.contains(&book) {
+            return Err("prepared_market_binding_invalid");
+        }
+        let status = project_submission(&tx.signatures[0].to_string(),
+            observed.as_ref().is_some_and(|s| s.satisfies_commitment(CommitmentConfig::finalized())),
+            observed.as_ref().is_some_and(|s| s.err.is_some()), observed.as_ref().map(|s| s.slot).unwrap_or(0), snapshot.context.slot)?;
+        result.as_object_mut().unwrap().extend(status.as_object().unwrap().clone());
+        result["transaction_sha256"] = request.prepared.as_ref().unwrap()["transaction_sha256"].clone();
+        // Known signatures are never sent again, regardless of confirmation level.
+        if observed.is_some() || request.operation == "read_submission" { return Ok(result); }
+    }
     if request.expected_state_sha256.as_deref() != Some(state_hash.as_str()) { return Err("state_changed"); }
-    let ixs = match request.operation.as_str() {
-        "prepare_entry" => runtime.block_on(build_protected_entry(&metadata, owner, signer.pubkey(), trader_account,
-            conditional_account, snapshot.context.slot, request.entry.as_ref().ok_or("entry_required")?))?,
-        "prepare_close" => runtime.block_on(build_protected_close(&metadata, owner, signer.pubkey(), trader_account,
-            conditional_account.ok_or("conditional_account_absent")?, snapshot.context.slot, request.close.as_ref().ok_or("close_required")?))?,
-        _ => return Err("operation_inputs_invalid"),
+    let ixs = if request.entry.is_some() {
+        runtime.block_on(build_protected_entry(&metadata, owner, signer.pubkey(), trader_account,
+            conditional_account, snapshot.context.slot, request.entry.as_ref().ok_or("entry_required")?))?
+    } else {
+        runtime.block_on(build_protected_close(&metadata, owner, signer.pubkey(), trader_account,
+            conditional_account.ok_or("conditional_account_absent")?, snapshot.context.slot, request.close.as_ref().ok_or("close_required")?))?
     };
+    if let Some(tx) = supplied_tx {
+        let mut expected = Transaction::new_with_payer(&ixs, Some(&signer.pubkey()));
+        expected.message.recent_blockhash = tx.message.recent_blockhash;
+        if expected.message != tx.message { return Err("prepared_instructions_changed"); }
+        if !rpc.is_blockhash_valid(&tx.message.recent_blockhash, CommitmentConfig::finalized()).map_err(|_| "blockhash_unavailable")? {
+            return Err("prepared_blockhash_expired");
+        }
+        let simulation = rpc.simulate_transaction_with_config(&tx, RpcSimulateTransactionConfig {
+            sig_verify:true, commitment:Some(CommitmentConfig::finalized()),
+            min_context_slot:Some(snapshot.context.slot), ..Default::default()
+        }).map_err(|_| "simulation_unavailable")?;
+        if simulation.value.err.is_some() { return Err("simulation_refused"); }
+        let outcome = dispatch_prepared_once(&tx, |original| rpc.send_transaction_with_config(original, RpcSendTransactionConfig {
+            skip_preflight:false, preflight_commitment:Some(CommitmentConfig::finalized().commitment),
+            max_retries:Some(0), min_context_slot:Some(snapshot.context.slot), ..Default::default()
+        }).map(|s| s.to_string()).map_err(|_| ()))?;
+        result.as_object_mut().unwrap().extend(outcome.as_object().unwrap().clone());
+        return Ok(result);
+    }
     let (blockhash, last_valid_block_height) = rpc.get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
         .map_err(|_| "rpc_unavailable")?;
     let mut tx = Transaction::new_with_payer(&ixs, Some(&signer.pubkey()));
@@ -378,13 +483,17 @@ fn run(request: Request) -> Result<Value, &'static str> {
     let fee = rpc.get_fee_for_message(&tx.message).map_err(|_| "fee_unavailable")?;
     let balance = rpc.get_balance_with_commitment(&signer.pubkey(), CommitmentConfig::finalized()).map_err(|_| "balance_unavailable")?;
     if balance.value < fee { return Err("fee_balance_insufficient"); }
-    let simulation = rpc.simulate_transaction(&tx).map_err(|_| "simulation_unavailable")?;
+    let simulation = rpc.simulate_transaction_with_config(&tx, RpcSimulateTransactionConfig {
+        sig_verify:true, commitment:Some(CommitmentConfig::finalized()),
+        min_context_slot:Some(snapshot.context.slot), ..Default::default()
+    }).map_err(|_| "simulation_unavailable")?;
     if simulation.value.err.is_some() { return Err("simulation_refused"); }
     prepared["fee_lamports"] = json!(fee);
     prepared["payer_balance_lamports"] = json!(balance.value);
     prepared["simulation_slot"] = json!(simulation.context.slot);
     prepared["last_valid_block_height"] = json!(last_valid_block_height);
     prepared["blockhash"] = json!(blockhash.to_string());
+    prepared["binding_signature"] = json!(signer.sign_message(&preparation_context(&request, &prepared)?).to_string());
     result["prepared"] = prepared;
     // Preparation only. Submission belongs to the separately gated account flow.
     Ok(result)
