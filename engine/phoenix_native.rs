@@ -14,15 +14,49 @@ use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use sha2::{Digest, Sha256};
+use phoenix_rise::api::PhoenixHttpClient;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Request {
+pub struct Request {
     operation: String,
     wallet_address: String,
     private_key: String,
     rpc_url: String,
     genesis_hash: String,
+    api_url: Option<String>,
+    symbol: Option<String>,
+    entry: Option<EntryPlan>,
+    close: Option<ClosePlan>,
+    expected_state_sha256: Option<String>,
+}
+
+impl Request {
+    // Reject ambiguous operation inputs before any RPC or key use.
+    pub fn operation_symbol(&self) -> Result<Option<&str>, &'static str> {
+        let symbol = match self.operation.as_str() {
+            "validate_connection" if self.symbol.is_none() && self.entry.is_none() && self.close.is_none()
+                && self.expected_state_sha256.is_none() && self.api_url.is_none() => return Ok(None),
+            "read_state" if self.entry.is_none() && self.close.is_none() && self.expected_state_sha256.is_none() => self.symbol.as_deref(),
+            "prepare_entry" if self.symbol.is_none() && self.close.is_none() => self.entry.as_ref().map(|p| p.symbol.as_str()),
+            "prepare_close" if self.symbol.is_none() && self.entry.is_none() => self.close.as_ref().map(|p| p.symbol.as_str()),
+            _ => return Err("operation_inputs_invalid"),
+        }.filter(|s| !s.is_empty() && s.trim() == *s).ok_or("symbol_required")?;
+        if !self.api_url.as_deref().is_some_and(valid_https_endpoint) { return Err("metadata_endpoint_required"); }
+        if self.operation.starts_with("prepare_") && !self.expected_state_sha256.as_deref()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            return Err("expected_state_required");
+        }
+        Ok(Some(symbol))
+    }
+}
+
+fn valid_https_endpoint(value: &str) -> bool {
+    value.strip_prefix("https://").is_some_and(|rest| {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        !authority.is_empty() && !authority.contains('@') && !value.contains('#')
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+    })
 }
 
 pub fn parse_identity(wallet: &str, secret: &str) -> Result<(Pubkey, Keypair), &'static str> {
@@ -281,14 +315,12 @@ pub fn prepared_transaction(tx: &Transaction, delegate: Pubkey) -> Result<Value,
 }
 
 fn run(request: Request) -> Result<Value, &'static str> {
-    if request.operation != "validate_connection" {
-        return Err("operation_unsupported");
-    }
-    if !request.rpc_url.starts_with("https://") || request.rpc_url.trim() != request.rpc_url || request.genesis_hash.is_empty() {
+    let symbol = request.operation_symbol()?;
+    if !valid_https_endpoint(&request.rpc_url) || request.genesis_hash.is_empty() {
         return Err("rpc_identity_required");
     }
     let (owner, signer) = parse_identity(&request.wallet_address, &request.private_key)?;
-    let rpc = RpcClient::new_with_timeout_and_commitment(request.rpc_url, Duration::from_secs(15), CommitmentConfig::finalized());
+    let rpc = RpcClient::new_with_timeout_and_commitment(request.rpc_url.clone(), Duration::from_secs(15), CommitmentConfig::finalized());
     let genesis = rpc.get_genesis_hash().map_err(|_| "rpc_unavailable")?;
     if genesis.to_string() != request.genesis_hash {
         return Err("rpc_genesis_mismatch");
@@ -299,6 +331,55 @@ fn run(request: Request) -> Result<Value, &'static str> {
     let mut result = validate_account(owner, signer.pubkey(), address, &FetchedAccount::new(account.data, account.owner, account.executable))?;
     result["finalized_slot"] = json!(response.context.slot);
     result["genesis_hash"] = json!(genesis.to_string());
+    let Some(symbol) = symbol else { return Ok(result) };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "native_runtime_unavailable")?;
+    let http = PhoenixHttpClient::new_public(request.api_url.clone().ok_or("metadata_endpoint_required")?)
+        .map_err(|_| "metadata_unavailable")?;
+    let exchange = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(15), http.get_exchange()).await })
+        .map_err(|_| "metadata_unavailable")?.map_err(|_| "metadata_unavailable")?;
+    let metadata = PhoenixMetadata::new(exchange.into());
+    let market = metadata.get_market(symbol).ok_or("market_unknown")?;
+    let book = Pubkey::from_str(&market.market_pubkey).map_err(|_| "market_identity_invalid")?;
+    let conditional = phoenix_rise::ix::prelude::get_conditional_orders_address(&address).map_err(|_| "conditional_address_invalid")?;
+    let snapshot = rpc.get_multiple_accounts_with_commitment(&[address, book, conditional], CommitmentConfig::finalized())
+        .map_err(|_| "rpc_unavailable")?;
+    if snapshot.context.slot == 0 || snapshot.value.len() != 3 { return Err("snapshot_invalid"); }
+    let accounts: Vec<_> = snapshot.value.into_iter().map(|a| a.map(|a| FetchedAccount::new(a.data, a.owner, a.executable))).collect();
+    let trader_account = accounts[0].as_ref().ok_or("trader_account_absent")?;
+    let orderbook_account = accounts[1].as_ref().ok_or("orderbook_account_absent")?;
+    let conditional_account = accounts[2].as_ref();
+    let state = project_state(&metadata, owner, signer.pubkey(), symbol, trader_account, conditional_account, orderbook_account)?;
+    let state_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&state).map_err(|_| "snapshot_invalid")?));
+    result["operation"] = json!(request.operation);
+    result["finalized_slot"] = json!(snapshot.context.slot);
+    result["state"] = state;
+    result["state_sha256"] = json!(state_hash);
+    if request.operation == "read_state" { return Ok(result); }
+    if request.expected_state_sha256.as_deref() != Some(state_hash.as_str()) { return Err("state_changed"); }
+    let ixs = match request.operation.as_str() {
+        "prepare_entry" => runtime.block_on(build_protected_entry(&metadata, owner, signer.pubkey(), trader_account,
+            conditional_account, snapshot.context.slot, request.entry.as_ref().ok_or("entry_required")?))?,
+        "prepare_close" => runtime.block_on(build_protected_close(&metadata, owner, signer.pubkey(), trader_account,
+            conditional_account.ok_or("conditional_account_absent")?, snapshot.context.slot, request.close.as_ref().ok_or("close_required")?))?,
+        _ => return Err("operation_inputs_invalid"),
+    };
+    let (blockhash, last_valid_block_height) = rpc.get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
+        .map_err(|_| "rpc_unavailable")?;
+    let mut tx = Transaction::new_with_payer(&ixs, Some(&signer.pubkey()));
+    tx.try_sign(&[&signer], blockhash).map_err(|_| "transaction_signing_failed")?;
+    let mut prepared = prepared_transaction(&tx, signer.pubkey())?;
+    let fee = rpc.get_fee_for_message(&tx.message).map_err(|_| "fee_unavailable")?;
+    let balance = rpc.get_balance_with_commitment(&signer.pubkey(), CommitmentConfig::finalized()).map_err(|_| "balance_unavailable")?;
+    if balance.value < fee { return Err("fee_balance_insufficient"); }
+    let simulation = rpc.simulate_transaction(&tx).map_err(|_| "simulation_unavailable")?;
+    if simulation.value.err.is_some() { return Err("simulation_refused"); }
+    prepared["fee_lamports"] = json!(fee);
+    prepared["payer_balance_lamports"] = json!(balance.value);
+    prepared["simulation_slot"] = json!(simulation.context.slot);
+    prepared["last_valid_block_height"] = json!(last_valid_block_height);
+    prepared["blockhash"] = json!(blockhash.to_string());
+    result["prepared"] = prepared;
+    // Preparation only. Submission belongs to the separately gated account flow.
     Ok(result)
 }
 

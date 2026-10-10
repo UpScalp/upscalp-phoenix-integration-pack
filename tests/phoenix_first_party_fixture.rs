@@ -14,6 +14,60 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use test_harness::{SdkLocalnetContext, default_sdk_localnet_fixture, find_sdk_localnet_program_paths, sdk_localnet_seed_bytes, phoenix_metadata_from_fixture};
 
 #[test]
+fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
+    let connection = serde_json::json!({"operation":"validate_connection", "wallet_address":"synthetic",
+        "private_key":"synthetic-not-consumed", "rpc_url":"https://rpc.example.invalid", "genesis_hash":"synthetic"});
+    let request: native::Request = serde_json::from_value(connection.clone()).unwrap();
+    assert_eq!(request.operation_symbol().unwrap(), None);
+    let mut state = connection.clone();
+    state["operation"] = serde_json::json!("read_state");
+    state["api_url"] = serde_json::json!("https://metadata.example.invalid");
+    state["symbol"] = serde_json::json!("BTC");
+    let request: native::Request = serde_json::from_value(state.clone()).unwrap();
+    assert_eq!(request.operation_symbol().unwrap(), Some("BTC"));
+    let mut entry = state.clone();
+    entry.as_object_mut().unwrap().remove("symbol");
+    entry["operation"] = serde_json::json!("prepare_entry");
+    entry["expected_state_sha256"] = serde_json::json!("0".repeat(64));
+    entry["entry"] = serde_json::json!({"symbol":"BTC", "direction":"SHORT", "base_lots":100,
+        "max_quote_lots":2_000_000_000_u64, "reference_price":100_000.0, "limit_price":99_000.0,
+        "stop_price":102_000.0, "stop_execution_price":102_100.0,
+        "targets":[{"price":98_000.0,"base_lots":40},{"price":97_000.0,"base_lots":60}],
+        "client_order_id":123,"last_valid_slot":1100});
+    let request: native::Request = serde_json::from_value(entry.clone()).unwrap();
+    assert_eq!(request.operation_symbol().unwrap(), Some("BTC"));
+    let mut close = state.clone();
+    close.as_object_mut().unwrap().remove("symbol");
+    close["operation"] = serde_json::json!("prepare_close");
+    close["expected_state_sha256"] = serde_json::json!("0".repeat(64));
+    close["close"] = serde_json::json!({"symbol":"BTC", "signed_base_lots":-100,
+        "position_sequence":1,"conditionals":[[0,1]],"limit_price":101_000.0,
+        "max_quote_lots":2_000_000_000_u64,"client_order_id":124,"last_valid_slot":1100});
+    let request: native::Request = serde_json::from_value(close.clone()).unwrap();
+    assert_eq!(request.operation_symbol().unwrap(), Some("BTC"));
+    for (mut input, key, value) in [
+        (connection.clone(), "entry", entry["entry"].clone()),
+        (state.clone(), "entry", entry["entry"].clone()),
+        (state.clone(), "symbol", serde_json::json!(" BTC ")),
+        (state.clone(), "api_url", serde_json::json!("http://metadata.example.invalid")),
+        (state.clone(), "api_url", serde_json::json!("https://user@metadata.example.invalid")),
+        (entry.clone(), "symbol", serde_json::json!("OTHER")),
+        (entry.clone(), "expected_state_sha256", serde_json::Value::Null),
+        (entry.clone(), "expected_state_sha256", serde_json::json!("G".repeat(64))),
+        (entry.clone(), "close", close["close"].clone()),
+        (close.clone(), "entry", entry["entry"].clone()),
+        (state.clone(), "operation", serde_json::json!("submit")),
+    ] {
+        input[key] = value;
+        let request: native::Request = serde_json::from_value(input).unwrap();
+        assert!(request.operation_symbol().is_err(), "invalid {key} accepted");
+    }
+    entry["entry"].as_object_mut().unwrap().remove("stop_execution_price");
+    assert!(serde_json::from_value::<native::Request>(entry).is_err());
+    println!("UPSCALP_NATIVE_REQUEST four_operations_bound=true ambiguous_inputs_refused=true explicit_stop_required=true io_calls=0");
+}
+
+#[test]
 fn native_connection_binds_dedicated_delegate_and_program_account() {
     let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
     let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
