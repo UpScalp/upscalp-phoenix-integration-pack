@@ -5,7 +5,7 @@ mod test_harness;
 #[path = "../examples/upscalp_phoenix_native.rs"]
 mod native;
 
-use phoenix_rise::{accounts::owned::{Trader, ConditionalOrderCollection, StopLossDirection, StopLossOrderKind, StopLossTradeSide}, core::{FetchedAccount, PhoenixTxBuilder, PhoenixMetadata}, ix::{PHOENIX_PROGRAM_ID, prelude::{DelegateTraderParams, create_delegate_trader_ix, get_conditional_orders_address}}};
+use phoenix_rise::{accounts::owned::{Trader, ConditionalOrderCollection, StopLossDirection, StopLossOrderKind, StopLossTradeSide}, core::{FetchedAccount, PhoenixTxBuilder, PhoenixMetadata}, ix::{PHOENIX_PROGRAM_ID, prelude::{DelegateTraderParams, create_delegate_trader_ix, get_conditional_orders_address, CancelConditionalOrderParams, create_cancel_conditional_order_ix}}};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -209,12 +209,21 @@ fn native_connection_binds_dedicated_delegate_and_program_account() {
 
 #[tokio::test]
 async fn delegated_entry_is_atomic_with_full_stop_and_exact_split_targets() {
-    delegated_protected_lifecycle(true).await;
+    delegated_protected_lifecycle(true, 0).await;
 }
 
 #[tokio::test]
 async fn delegated_short_is_atomic_with_full_stop_and_exact_split_targets() {
-    delegated_protected_lifecycle(false).await;
+    delegated_protected_lifecycle(false, 0).await;
+}
+
+#[tokio::test]
+async fn delegated_close_preserves_exact_remaining_protection_inventory() {
+    for long in [true, false] {
+        for removed in [0, 1, 3] {
+            delegated_protected_lifecycle(long, removed).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -262,7 +271,7 @@ async fn stop_band_is_explicit_one_percent_after_tick_rounding() {
     println!("UPSCALP_STOP_BAND explicit_one_percent=true long_short_tick_boundary=true outward_rounding_refused=true builder_writes=0");
 }
 
-async fn delegated_protected_lifecycle(long: bool) {
+async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
     let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
     ctx.execute_setup();
@@ -364,6 +373,24 @@ async fn delegated_protected_lifecycle(long: bool) {
     let mut wrong_market = metadata.exchange().clone();
     wrong_market.markets.get_mut("BTC").unwrap().tick_size += 1;
     assert!(native::project_state(&PhoenixMetadata::new(wrong_market), owner, delegate, "BTC", &current, None, &book_account).is_err());
+    if removed != 0 {
+        let cancellations: Vec<Instruction> = collection.active_orders()
+            .filter(|(_, order)| removed == 3 || order.use_percent)
+            .map(|(index, _)| create_cancel_conditional_order_ix(CancelConditionalOrderParams::builder()
+                .trader_account(address).position_authority(delegate).orderbook(book_address)
+                .conditional_order_index(index).disable_first(true).disable_second(true)
+                .build().unwrap()).unwrap().into()).collect();
+        assert_eq!(cancellations.len(), removed);
+        ctx.send_instructions(cancellations, &delegate_seed, "synthetic-missing-protection");
+    }
+    let current = FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false);
+    let remaining = Trader::try_from_account_bytes(&current.data).unwrap();
+    let remaining_position = remaining.position_entries().find(|row| row.asset_id == 0).unwrap();
+    assert_eq!(remaining_position.position.base_lot_position.as_inner(), signed_lots);
+    assert_eq!(remaining_position.position.position_sequence_number,
+        state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number);
+    let collection = ConditionalOrderCollection::try_from_account_bytes(&ctx.account_data(&conditional)).unwrap();
+    assert_eq!(collection.active_orders().count(), 3 - removed);
     let close = native::ClosePlan {
         symbol: "BTC".into(), signed_base_lots: signed_lots,
         position_sequence: state.position_entries().find(|row| row.asset_id == 0).unwrap().position.position_sequence_number,
@@ -375,12 +402,17 @@ async fn delegated_protected_lifecycle(long: bool) {
     for invalid in [
         native::ClosePlan { signed_base_lots: -signed_lots, ..close.clone() },
         native::ClosePlan { position_sequence: close.position_sequence.wrapping_add(1), ..close.clone() },
-        native::ClosePlan { conditionals: vec![], ..close.clone() },
-        native::ClosePlan { conditionals: vec![(close.conditionals[0].0, close.conditionals[0].1 + 1)], ..close.clone() },
+        native::ClosePlan { signed_base_lots: signed_lots + 1, ..close.clone() },
+        native::ClosePlan { conditionals: if close.conditionals.is_empty() { vec![(0, 0)] } else { vec![] }, ..close.clone() },
+        native::ClosePlan { conditionals: close.conditionals.iter().map(|(index, sequence)| (*index, sequence + 1))
+            .chain(std::iter::once((7, u64::MAX))).collect(), ..close.clone() },
         native::ClosePlan { last_valid_slot: slot, ..close.clone() },
     ] {
         assert!(native::build_protected_close(&metadata, owner, delegate, &current, &conditional_account, slot, &invalid).await.is_err());
     }
+    assert!(native::build_protected_close(&metadata, delegate, owner, &current, &conditional_account, slot, &close).await.is_err());
+    assert_eq!(current.data, ctx.account_data(&address));
+    assert_eq!(conditional_data, ctx.account_data(&conditional));
     let close_ixs = native::build_protected_close(&metadata, owner, delegate, &current, &conditional_account, slot, &close).await.unwrap();
     let mut broken_close = close_ixs.clone();
     broken_close.last_mut().unwrap().data[0] ^= 0xff;
@@ -397,6 +429,6 @@ async fn delegated_protected_lifecycle(long: bool) {
         Some(&FetchedAccount::new(ctx.account_data(&conditional), *PHOENIX_PROGRAM_ID, false)), &book_account).unwrap();
     assert_eq!(closed_projection["signed_base_lots"], 0);
     assert_eq!(closed_projection["conditionals"].as_array().unwrap().len(), 0);
-    println!("UPSCALP_NATIVE_CLOSE direction={} position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true", plan.direction);
+    println!("UPSCALP_NATIVE_CLOSE direction={} removed_before_close={} position_lots=0 retained_conditional_orders=0 close_cleanup_atomic=true", plan.direction, removed);
     println!("UPSCALP_NATIVE_ENTRY direction={} delegated=true signed_filled_lots={} stop_remaining_percent=100 target_lots=40,60 transaction_bytes={} protection_failure_rolls_back_entry=true duplicate_entry_refused=true", plan.direction, signed_lots, bytes.len());
 }

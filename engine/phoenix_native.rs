@@ -243,7 +243,7 @@ pub async fn build_protected_close(
     let collection = ConditionalOrderCollection::try_from_account_bytes(&conditional_account.data).map_err(|_| "conditional_account_invalid")?;
     let actual: Vec<_> = collection.active_orders().filter(|(_, order)| order.asset_id == market.asset_id)
         .map(|(index, order)| (index, order.sequence_number)).collect();
-    if collection.header.trader_key != trader || actual != plan.conditionals || actual.is_empty() || actual.len() > 3 {
+    if collection.header.trader_key != trader || actual != plan.conditionals || actual.len() > 3 {
         return Err("conditional_inventory_changed");
     }
     let builder = PhoenixTxBuilder::new(metadata);
