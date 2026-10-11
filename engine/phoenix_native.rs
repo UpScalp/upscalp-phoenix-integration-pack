@@ -449,6 +449,14 @@ pub fn validate_prepared(request: &Request, delegate: Pubkey) -> Result<Transact
         .map_err(|_| "prepared_transaction_invalid")?;
     if bytes.is_empty() || bytes.len() > 1232 { return Err("prepared_transaction_invalid"); }
     let tx: Transaction = bincode::deserialize(&bytes).map_err(|_| "prepared_transaction_invalid")?;
+    // Only status reads use the historical signer recorded in the signed bytes.
+    // Current account authority is still checked separately; submission never falls back.
+    let delegate = if request.operation == "read_submission" {
+        let original = *tx.message.account_keys.first().ok_or("prepared_transaction_invalid")?;
+        let owner = Pubkey::from_str(&request.wallet_address).map_err(|_| "wallet_address_invalid")?;
+        if original == Pubkey::default() || original == owner { return Err("dedicated_delegate_required"); }
+        original
+    } else { delegate };
     let canonical = prepared_transaction(&tx, delegate)?;
     if canonical.as_object().unwrap().iter().any(|(key, value)| prepared.get(key) != Some(value))
         || prepared["blockhash"].as_str() != Some(tx.message.recent_blockhash.to_string().as_str()) {
@@ -703,7 +711,7 @@ fn run(request: Request) -> Result<Value, &'static str> {
                 let record = rpc.send::<Value>(solana_rpc_client::api::request::RpcRequest::GetTransaction,
                     json!([tx.signatures[0].to_string(), {"encoding":"base64", "commitment":"finalized", "maxSupportedTransactionVersion":0}]));
                 result["execution"] = record.map_err(|_| "execution_evidence_unavailable").and_then(|record|
-                    project_execution(&metadata, owner, signer.pubkey(), plan, tx, observed.as_ref().unwrap().slot, &record))
+                    project_execution(&metadata, owner, tx.message.account_keys[0], plan, tx, observed.as_ref().unwrap().slot, &record))
                     .unwrap_or_else(|reason| json!({"status":"unavailable", "reason":reason}));
             }
         }

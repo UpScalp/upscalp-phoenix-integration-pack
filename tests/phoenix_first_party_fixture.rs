@@ -70,6 +70,7 @@ fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
 #[test]
 fn prepared_status_preserves_original_plan_and_finality_without_io() {
     let signer = Keypair::new_from_array([71; 32]);
+    let current = Keypair::new_from_array([73; 32]);
     let owner = Keypair::new_from_array([72; 32]).pubkey();
     let mut input = serde_json::json!({"operation":"prepare_entry", "wallet_address":owner.to_string(),
         "private_key":"not-used", "rpc_url":"https://rpc.example.invalid", "genesis_hash":"test",
@@ -101,7 +102,27 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
     }
     let mut changed = input.clone(); changed["prepared"]["signature"] = serde_json::json!("wrong");
     assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), signer.pubkey()).is_err());
-    assert!(native::validate_prepared(&request, owner).is_err());
+    assert_eq!(native::validate_prepared(&request, current.pubkey()).unwrap(), tx);
+    let mut changed = input.clone(); changed["operation"] = serde_json::json!("submit_prepared");
+    assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), owner).is_err());
+    let mut changed = input.clone();
+    changed["prepared"]["binding_signature"] = serde_json::json!(current.sign_message(
+        &native::preparation_context(&request, &input["prepared"]).unwrap()).to_string());
+    assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), current.pubkey()).is_err());
+    let mut changed_tx = tx.clone(); changed_tx.message.account_keys[0] = current.pubkey();
+    let mut changed = input.clone();
+    changed["prepared"]["transaction_base64"] = serde_json::json!(STANDARD.encode(bincode::serialize(&changed_tx).unwrap()));
+    assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), current.pubkey()).is_err());
+    // Even a valid owner-signed receipt is not a dedicated-delegate receipt.
+    let owner_signer = Keypair::new_from_array([72; 32]);
+    let mut owner_tx = tx.clone(); owner_tx.message.account_keys[0] = owner;
+    owner_tx.try_sign(&[&owner_signer], owner_tx.message.recent_blockhash).unwrap();
+    let mut owner_receipt = native::prepared_transaction(&owner_tx, owner).unwrap();
+    owner_receipt["blockhash"] = serde_json::json!(owner_tx.message.recent_blockhash.to_string());
+    owner_receipt["binding_signature"] = serde_json::json!(owner_signer.sign_message(
+        &native::preparation_context(&request, &owner_receipt).unwrap()).to_string());
+    let mut changed = input.clone(); changed["prepared"] = owner_receipt;
+    assert!(native::validate_prepared(&serde_json::from_value(changed).unwrap(), current.pubkey()).is_err());
     // Parse the wire request directly: Value itself cannot retain a full u128.
     for kind in ["entry", "close"] {
         for id in [123_u128, u64::MAX as u128, u64::MAX as u128 + 1, u128::MAX] {
@@ -129,6 +150,11 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
             for operation in ["read_submission", "submit_prepared"] {
                 wire["operation"] = serde_json::json!(operation);
                 assert_eq!(native::validate_prepared(&decode(&wire, id), signer.pubkey()).unwrap(), tx);
+                let frozen = serde_json::to_vec(&wire).unwrap();
+                let rotated = native::validate_prepared(&decode(&wire, id), current.pubkey());
+                if operation == "read_submission" { assert_eq!(rotated.unwrap(), tx); }
+                else { assert!(rotated.is_err()); }
+                assert_eq!(serde_json::to_vec(&wire).unwrap(), frozen);
                 assert!(native::validate_prepared(&decode(&wire, id - 1), signer.pubkey()).is_err());
                 for (key, value) in [("expected_state_sha256",serde_json::json!("b".repeat(64))),
                     ("wallet_address",serde_json::json!(signer.pubkey().to_string())),
@@ -195,6 +221,11 @@ fn prepared_status_preserves_original_plan_and_finality_without_io() {
     for operation in ["read_submission","submit_prepared"] {
         replacement["operation"] = serde_json::json!(operation);
         assert_eq!(native::validate_prepared(&serde_json::from_value(replacement.clone()).unwrap(),signer.pubkey()).unwrap(),tx);
+        let frozen = serde_json::to_vec(&replacement).unwrap();
+        let rotated = native::validate_prepared(&serde_json::from_value(replacement.clone()).unwrap(),current.pubkey());
+        if operation == "read_submission" { assert_eq!(rotated.unwrap(),tx); }
+        else { assert!(rotated.is_err()); }
+        assert_eq!(serde_json::to_vec(&replacement).unwrap(),frozen);
         let mut bad = replacement.clone(); bad["replace_stop"]["old_stop"] = serde_json::json!([0,2]);
         assert!(native::validate_prepared(&serde_json::from_value(bad).unwrap(),signer.pubkey()).is_err());
         let mut bad = replacement.clone(); bad["prepared"]["replace_before"]["signed_base_lots"] = serde_json::json!(99);
@@ -243,6 +274,13 @@ fn native_connection_binds_dedicated_delegate_and_program_account() {
         assert!(native::validate_account(owner, delegate, address, &invalid).is_err());
     }
     assert_eq!(data, ctx.account_data(&address));
+    let current = Keypair::new_from_array([73; 32]).pubkey();
+    let ix: Instruction = create_delegate_trader_ix(DelegateTraderParams::builder()
+        .trader_wallet(owner).trader_account(address).new_position_authority(current).build().unwrap()).unwrap().into();
+    ctx.send_instructions(vec![ix], &owner_seed, "synthetic-rotation");
+    let rotated = FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false);
+    assert_eq!(native::validate_account(owner, delegate, address, &rotated).unwrap_err(), "delegate_not_authorized");
+    assert_eq!(native::validate_account(owner, current, address, &rotated).unwrap()["delegate_address"],current.to_string());
     println!("UPSCALP_NATIVE_CONNECTION delegated=true account_and_program_bound=true rejects_owner_key_and_foreign_scope=true probe_writes=0 execution_ready=false");
 }
 
@@ -386,6 +424,9 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     let record = serde_json::json!({"slot":slot, "transaction":[STANDARD.encode(bincode::serialize(&executed_tx).unwrap()),"base64"],
         "meta":{"err":null,"fee":receipt.fee,"innerInstructions":inner}});
     let execution = native::project_execution(&metadata, owner, delegate, &plan, &executed_tx, slot, &record).unwrap();
+    assert!(native::project_execution(&metadata, owner, Keypair::new_from_array([73; 32]).pubkey(), &plan, &executed_tx, slot, &record).is_err());
+    assert_eq!(native::project_execution(&metadata, owner, executed_tx.message.account_keys[0],
+        &plan, &executed_tx, slot, &record).unwrap(), execution);
     assert_eq!(execution["base_lots_filled"], 100);
     assert_eq!(execution["signed_base_lots"], signed_lots);
     assert!(execution["average_price"].as_f64().unwrap() > 0.0);
