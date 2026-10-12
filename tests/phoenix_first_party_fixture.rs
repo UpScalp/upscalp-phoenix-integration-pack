@@ -14,6 +14,143 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use test_harness::{SdkLocalnetContext, default_sdk_localnet_fixture, find_sdk_localnet_program_paths, sdk_localnet_seed_bytes, phoenix_metadata_from_fixture};
 
 #[test]
+fn wallet_delegation_is_unsigned_owner_only_and_separate_from_trading() {
+    let owner = Keypair::new_from_array([83; 32]).pubkey();
+    let delegate = Keypair::new_from_array([84; 32]).pubkey();
+    let ix = native::delegation_instruction(owner, delegate).unwrap();
+    let expected: Instruction = create_delegate_trader_ix(DelegateTraderParams::builder()
+        .trader_wallet(owner).trader_account(phoenix_rise::core::TraderKey::new(owner).pda())
+        .new_position_authority(delegate).build().unwrap()).unwrap().into();
+    assert_eq!(ix, expected);
+    let tx = solana_transaction::Transaction::new_with_payer(&[ix], Some(&owner));
+    assert_eq!(tx.message.instructions.len(), 1);
+    assert_eq!(tx.message.header.num_required_signatures, 1);
+    assert_eq!(tx.message.account_keys[0], owner);
+    assert!(tx.signatures.iter().all(|signature| *signature == Default::default()));
+    for (a,b) in [(owner,owner),(owner,solana_pubkey::Pubkey::default()),(solana_pubkey::Pubkey::default(),delegate)] {
+        assert!(native::delegation_instruction(a,b).is_err());
+    }
+    let request = serde_json::json!({"operation":"setup_generate_key", "wallet_address":owner.to_string(),
+        "rpc_url":"https://rpc.example.invalid", "genesis_hash":"synthetic-not-contacted"});
+    for field in ["private_key", "entry", "prepared", "api_url"] {
+        let mut bad = request.clone(); bad[field] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<native::DelegationRequest>(bad).is_err());
+    }
+    let generated = native::run_delegation(serde_json::from_value(request.clone()).unwrap()).unwrap();
+    let (_, signer) = native::parse_identity(&owner.to_string(), generated["private_key"].as_str().unwrap()).unwrap();
+    assert_eq!(generated["delegate_address"], signer.pubkey().to_string());
+    assert_eq!(generated["submitted"], false);
+    for op in ["setup_send", "submit_prepared", "prepare_entry"] {
+        let mut bad = request.clone(); bad["operation"] = serde_json::json!(op);
+        assert_eq!(native::run_delegation(serde_json::from_value(bad).unwrap()).unwrap_err(), "setup_operation_invalid");
+    }
+    println!("wallet_delegation unsigned=true owner_only=true forbidden_input_refused=true rpc_calls=0");
+}
+
+#[test]
+fn wallet_reconnection_replaces_only_with_owner_approval_and_recognizes_same_delegate() {
+    use solana_rpc_client::{rpc_client::RpcClient, api::request::RpcRequest};
+    use serde_json::json;
+    let paths = find_sdk_localnet_program_paths().expect("pinned programs required; no skip");
+    let mut ctx = SdkLocalnetContext::new(default_sdk_localnet_fixture().unwrap(), paths);
+    ctx.execute_setup();
+    let owner = ctx.actor_pubkey("taker0");
+    let old_delegate = ctx.actor_pubkey("taker1");
+    let delegate = Keypair::new_from_array([85; 32]).pubkey();
+    let address = ctx.actor_trader("taker0");
+    let owner_seed = ctx.actor("taker0").seed;
+    let undelegated = ctx.account_data(&address);
+    ctx.send_instructions(vec![native::delegation_instruction(owner, old_delegate).unwrap()],
+        &owner_seed, "reconnect-old-delegate");
+    let delegated = ctx.account_data(&address);
+    let genesis = solana_pubkey::Pubkey::new_from_array([9; 32]).to_string();
+    for (data, wanted, verified) in [(&undelegated, delegate, false), (&delegated, delegate, false),
+        (&delegated, old_delegate, true)] {
+        for operation in ["setup_prepare_delegation", "setup_read_delegation"] {
+            let mocks = solana_rpc_client::mock_sender::MocksMap::from_iter([
+                (RpcRequest::GetGenesisHash, json!(genesis)),
+                (RpcRequest::GetAccountInfo, json!({"context":{"slot":77},"value":{
+                    "data":[STANDARD.encode(data),"base64"],"owner":PHOENIX_PROGRAM_ID.to_string(),
+                    "executable":false,"lamports":1,"rentEpoch":0}})),
+                (RpcRequest::GetLatestBlockhash, json!({"context":{"slot":77},"value":{
+                    "blockhash":genesis,"lastValidBlockHeight":999}})),
+                (RpcRequest::GetFeeForMessage, json!({"context":{"slot":77},"value":5000})),
+                (RpcRequest::GetBalance, json!({"context":{"slot":77},"value":3_005_000})),
+                (RpcRequest::GetBalance, json!({"context":{"slot":77},"value":5000})),
+            ]);
+            let request = serde_json::from_value(json!({"operation":operation,"wallet_address":owner.to_string(),
+                "delegate_address":wanted.to_string(),"rpc_url":"https://rpc.example.invalid","genesis_hash":genesis})).unwrap();
+            let result = native::run_delegation_with_rpc(request, &RpcClient::new_mock_with_mocks_map("succeeds", mocks)).unwrap();
+            assert_eq!(result["delegation_verified"], verified);
+            assert_eq!(result["submitted"], false);
+            assert_eq!(result["finalized_slot"], 77);
+            if operation == "setup_prepare_delegation" && !verified {
+                let tx = solana_transaction::Transaction::new_with_payer(
+                    &[native::delegation_instruction(owner, wanted).unwrap()], Some(&owner));
+                let mut message = tx.message; message.recent_blockhash = genesis.parse().unwrap();
+                assert_eq!(STANDARD.decode(result["message_base64"].as_str().unwrap()).unwrap(), message.serialize());
+                assert_eq!(message.header.num_required_signatures, 1);
+                assert_eq!(message.account_keys[0], owner);
+                assert_eq!(result["last_valid_block_height"], 999);
+            } else {
+                assert!(result.get("message_base64").is_none());
+                assert!(result.get("last_valid_block_height").is_none());
+            }
+        }
+    }
+    assert_eq!(ctx.account_data(&address), delegated); // Prepare/status did not mutate even the VM.
+    let mut funded_transaction = None;
+    for delegate_balance in [0_u64, 2_999_999, 3_000_000, 3_000_001] {
+        let transfer = if delegate_balance < 3_000_000 { 3_000_000 } else { 0 };
+        for enough in [false, true] {
+            let owner_balance = 5000 + transfer - u64::from(!enough);
+            let mocks = solana_rpc_client::mock_sender::MocksMap::from_iter([
+                (RpcRequest::GetGenesisHash, json!(genesis)),
+                (RpcRequest::GetAccountInfo, json!({"context":{"slot":77},"value":{
+                    "data":[STANDARD.encode(&delegated),"base64"],"owner":PHOENIX_PROGRAM_ID.to_string(),
+                    "executable":false,"lamports":1,"rentEpoch":0}})),
+                (RpcRequest::GetLatestBlockhash, json!({"context":{"slot":77},"value":{
+                    "blockhash":genesis,"lastValidBlockHeight":999}})),
+                (RpcRequest::GetFeeForMessage, json!({"context":{"slot":77},"value":5000})),
+                (RpcRequest::GetBalance, json!({"context":{"slot":77},"value":delegate_balance})),
+                (RpcRequest::GetBalance, json!({"context":{"slot":77},"value":owner_balance})),
+            ]);
+            let request = serde_json::from_value(json!({"operation":"setup_prepare_delegation",
+                "wallet_address":owner.to_string(),"delegate_address":delegate.to_string(),
+                "rpc_url":"https://rpc.example.invalid","genesis_hash":genesis})).unwrap();
+            let result = native::run_delegation_with_rpc(request, &RpcClient::new_mock_with_mocks_map("succeeds", mocks));
+            if !enough {
+                assert_eq!(result.unwrap_err(), "owner_fee_balance_insufficient");
+                continue;
+            }
+            let result = result.unwrap();
+            assert_eq!(result["delegation_verified"], false);
+            assert_eq!(result["submitted"], false);
+            let mut tx = solana_transaction::Transaction::new_with_payer(&[], Some(&owner));
+            tx.message = bincode::deserialize(&STANDARD.decode(result["message_base64"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(tx.message.header.num_required_signatures, 1);
+            assert_eq!(tx.message.account_keys[0], owner);
+            assert_eq!(tx.message.instructions.len(), if transfer > 0 { 2 } else { 1 });
+            if transfer > 0 {
+                let ix = &tx.message.instructions[1];
+                assert_eq!(tx.message.account_keys[ix.program_id_index as usize], solana_pubkey::Pubkey::default());
+                assert_eq!(ix.accounts.iter().map(|i| tx.message.account_keys[*i as usize]).collect::<Vec<_>>(), vec![owner, delegate]);
+                assert_eq!(ix.data, [2_u32.to_le_bytes().as_slice(), 3_000_000_u64.to_le_bytes().as_slice()].concat());
+                if delegate_balance == 0 { funded_transaction = Some(tx); }
+            }
+        }
+    }
+    let mut tx = funded_transaction.unwrap();
+    let before = ctx.svm.get_balance(&delegate).unwrap_or(0);
+    tx.try_sign(&[&Keypair::new_from_array(sdk_localnet_seed_bytes(&ctx.fixture.keypair_base_seed, &owner_seed))], ctx.svm.latest_blockhash()).unwrap();
+    ctx.svm.send_transaction(tx).expect("owner-approved delegation and fee transfer must execute atomically in VM");
+    assert_eq!(ctx.svm.get_balance(&delegate).unwrap(), before + 3_000_000);
+    assert_eq!(native::delegation_account(owner,
+        &FetchedAccount::new(ctx.account_data(&address), *PHOENIX_PROGRAM_ID, false)).unwrap(), delegate);
+    println!("reconnection six_native_paths_pass funding_eight_boundary_cases_pass atomic_delegation_transfer_vm_pass same_delegate_no_message=true network_calls=0");
+}
+
+#[test]
 fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
     let connection = serde_json::json!({"operation":"validate_connection", "wallet_address":"synthetic",
         "private_key":"synthetic-not-consumed", "rpc_url":"https://rpc.example.invalid", "genesis_hash":"synthetic"});
@@ -64,6 +201,12 @@ fn native_runtime_request_refuses_ambiguous_inputs_before_io() {
     }
     entry["entry"].as_object_mut().unwrap().remove("stop_execution_price");
     assert!(serde_json::from_value::<native::Request>(entry).is_err());
+    // New setup dispatch must retain the full-width existing trading parser.
+    close["rpc_url"] = serde_json::json!("http://rpc.example.invalid");
+    let full_width = serde_json::to_string(&close).unwrap()
+        .replace("\"client_order_id\":124", &format!("\"client_order_id\":{}",u128::MAX));
+    assert!(full_width.contains(&u128::MAX.to_string()));
+    assert_eq!(native::run_input(&full_width).unwrap_err(), "rpc_identity_required");
     println!("UPSCALP_NATIVE_REQUEST four_operations_bound=true ambiguous_inputs_refused=true explicit_stop_required=true io_calls=0");
 }
 
@@ -324,6 +467,7 @@ async fn stop_band_is_explicit_one_percent_after_tick_rounding() {
         let stop = base / 100 * 100 + 51;
         let boundary = if long { stop - stop / 100 } else { stop + stop / 100 };
         let plan = native::EntryPlan {
+            test_trade_unprotected: false,
             symbol:"BTC".into(), direction:if long { "LONG" } else { "SHORT" }.into(),
             base_lots:100, max_quote_lots:2_000_000_000, reference_price:100_000.0,
             limit_price:if long { 101_000.0 } else { 99_000.0 },
@@ -374,6 +518,7 @@ async fn delegated_protected_lifecycle(long: bool, removed: usize) {
     ctx.svm.set_account(clock_key, clock_account).unwrap();
     let mut signed_lots = if long { 100 } else { -100 };
     let plan = native::EntryPlan {
+        test_trade_unprotected: false,
         symbol: "BTC".into(), direction: if long { "LONG" } else { "SHORT" }.into(), base_lots: 100, max_quote_lots: 2_000_000_000,
         reference_price: 100_000.0, limit_price: if long { 101_000.0 } else { 99_000.0 },
         stop_price: if long { 98_000.0 } else { 102_000.0 }, stop_execution_price: if long { 97_900.0 } else { 102_100.0 },

@@ -66,3 +66,42 @@ live instrument mapping, so the example cannot become an executable order.
   the recorded lifecycle, not editable evidence.
 
 The format does not expose cohort membership, attempts, identities or feedback.
+
+## Wallet approval payload
+
+The hosted setup flow generates a dedicated trading key server-side and builds
+an unsigned owner-paid DelegateTrader message. This is a separate account
+setup operation from the trade format above. The owner signs in Phantom; the
+owner key is never provided to the server. The native `message_base64` field
+is a legacy **message**, whereas Phantom's `signAndSendTransaction` request
+requires a base58 **transaction**. Prepend the required signature count and
+64 zero bytes per signer before encoding. Passing the message directly was
+the released version-50 deserialization defect.
+
+The following is the shipped conversion, with no library or private imports:
+
+```javascript
+  function messageBase58(encoded) {
+    const message = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+    const signatures = message[0];
+    if (message.length < 3 || !signatures || signatures >= 128 ||
+        1 + 64 * signatures + message.length > 1232) throw new Error('message_size');
+    const bytes = new Uint8Array(1 + 64 * signatures + message.length);
+    bytes[0] = signatures;
+    bytes.set(message, 1 + 64 * signatures);
+    const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    let number = 0n, text = '', zeros = 0;
+    for (const byte of bytes) number = number * 256n + BigInt(byte);
+    while (number) { text = alphabet[Number(number % 58n)] + text; number /= 58n; }
+    while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+    return '1'.repeat(zeros) + text;
+  }
+```
+
+The page passes its result as `params.message` to the injected Phantom
+provider's `request({method: 'signAndSendTransaction', params: ...})`.
+The existing request options are `skipPreflight: false`,
+`preflightCommitment: 'finalized'`, and `maxRetries: 0`. Do not treat a returned
+signature as proof of delegation: the hosted flow verifies the on-chain
+position authority against the generated key before credential registration.
+This snippet performs serialization only; it neither signs nor sends.

@@ -1,4 +1,5 @@
-// Owner-local tool, pinned SDK 0.6.6. Never install in UpScalp's service.
+// PO-local route, pinned SDK0.6.6. Never install in UpScalp's service.
+// PO approved this code only; agent execution is throwaway-key simulation only.
 use std::{fs::{self, OpenOptions}, io::{Read, Write}, path::Path, str::FromStr, time::Duration};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, MetadataExt};
 use phoenix_rise::{accounts::owned::Trader, core::TraderKey,
@@ -109,7 +110,7 @@ fn probe_unfunded() -> Result<Value> {
             .map_err(|_| "blockhash_unavailable")?;
         let tx = Transaction::new_signed_with_payer(&[ix], Some(&owner.pubkey()), &[&owner], blockhash);
         // A public fee-quote failure must not be mistaken for a simulation.
-        // This disposable-key diagnostic records it; the owner send path below
+        // This disposable-key diagnostic records it; the PO send path below
         // still refuses unless its own exact fee quote succeeds.
         let fee = rpc.get_fee_for_message(&tx.message);
         let simulation = rpc.simulate_transaction_with_config(&tx, RpcSimulateTransactionConfig {

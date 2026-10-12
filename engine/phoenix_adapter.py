@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -47,6 +48,7 @@ class PhoenixNativeResult(TypedDict, total=False):
     transport_uncertain: bool
     execution: dict[str, object]
     replacement: dict[str, object]
+    expiry: dict[str, object]
 
 
 def phoenix_account_operation(
@@ -55,16 +57,22 @@ def phoenix_account_operation(
 ) -> PhoenixNativeResult:
     """Bound native account operation; activation is gated by the account caller."""
     operation = request.get("operation")
+    setup = operation in {"setup_generate_key", "setup_prepare_delegation", "setup_read_delegation"}
     keys = {"validate_connection": {"operation"}, "read_state": {"operation", "symbol"},
             "prepare_entry": {"operation", "entry", "expected_state_sha256"},
             "prepare_close": {"operation", "close", "expected_state_sha256"},
-            "prepare_replace_stop": {"operation", "replace_stop", "expected_state_sha256"}}
+            "prepare_replace_stop": {"operation", "replace_stop", "expected_state_sha256"},
+            "setup_generate_key": {"operation"},
+            "setup_prepare_delegation": {"operation", "delegate_address"},
+            "setup_read_delegation": {"operation", "delegate_address"}}
     if operation in ("read_submission", "submit_prepared"):
         keys[operation] = {"operation", "prepared", "expected_state_sha256",
                            "entry" if "entry" in request else "close" if "close" in request else "replace_stop"}
     if not isinstance(operation, str) or operation not in keys or set(request) != keys[operation]:
         raise ValueError("Phoenix operation inputs are incomplete or unsupported")
-    if operation != "validate_connection":
+    if setup and (set(credentials) != {"wallet_address"} or api_url):
+        raise ValueError("Phoenix setup accepts only the public owner address")
+    if operation != "validate_connection" and not setup:
         endpoint = urlsplit(api_url)
         if endpoint.scheme != "https" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.fragment:
             raise ValueError("Phoenix metadata endpoint is incomplete or invalid")
@@ -78,30 +86,38 @@ def phoenix_account_operation(
         or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", genesis_hash)
     ):
         raise ValueError("Phoenix native configuration is incomplete or invalid")
-    try:
-        with path.open("rb") as handle:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != executable_sha256:
-            raise ValueError("Phoenix native executable hash mismatch")
-    except OSError:
-        raise RuntimeError("Phoenix native executable is unavailable") from None
     payload = {
         **request,
         "wallet_address": credentials.get("wallet_address", ""),
-        "private_key": credentials.get("private_key", ""),
         "rpc_url": rpc_url,
         "genesis_hash": genesis_hash,
     }
-    if operation != "validate_connection":
+    if not setup:
+        payload["private_key"] = credentials.get("private_key", "")
+    if operation != "validate_connection" and not setup:
         payload["api_url"] = api_url
     try:
-        completed = subprocess.run(
-            [str(path)], input=json.dumps(payload, allow_nan=False), text=True, capture_output=True,
-            timeout=120 if operation != "validate_connection" else 40, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        import fcntl
+        # Execute the exact verified bytes, not a pathname that can change after
+        # hashing. Sealing also prevents in-place changes through another handle.
+        with path.open("rb") as source, os.fdopen(os.memfd_create(
+                "phoenix-native", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING), "w+b") as image:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+                image.write(chunk)
+            image.flush()
+            if digest.hexdigest() != executable_sha256:
+                raise ValueError("Phoenix native executable hash mismatch")
+            os.fchmod(image.fileno(), 0o500)
+            fcntl.fcntl(image.fileno(), fcntl.F_ADD_SEALS,
+                        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+            completed = subprocess.run(
+                [f"/proc/self/fd/{image.fileno()}"], pass_fds=(image.fileno(),),
+                input=json.dumps(payload, allow_nan=False), text=True, capture_output=True,
+                timeout=120 if operation != "validate_connection" else 40, check=False,
+            )
+    except (AttributeError, ImportError, OSError, subprocess.SubprocessError):
         # Timeout exceptions retain input: never forward their repr/message.
         raise RuntimeError("Phoenix native probe unavailable or timed out") from None
     try:
@@ -110,7 +126,40 @@ def phoenix_account_operation(
         raise RuntimeError("Phoenix native probe returned an invalid response") from None
     if completed.returncode != 0 or not isinstance(result, dict) or result.get("status") != "ok":
         # Do not expose process stderr, endpoint details, or arbitrary response text.
-        raise RuntimeError("Phoenix account or delegation could not be verified")
+        raise RuntimeError(f"Phoenix account or delegation could not be verified: {result.get('code') if isinstance(result, dict) else 'unknown'}")
+    if setup:
+        if (result.get("operation") != operation or result.get("wallet_address") != payload["wallet_address"]
+                or result.get("submitted") is not False
+                or not isinstance(result.get("delegate_address"), str)
+                or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", result["delegate_address"])
+                or result["delegate_address"] == payload["wallet_address"]):
+            raise RuntimeError("Phoenix setup identity binding failed")
+        if operation == "setup_generate_key":
+            if (set(result) != {"status", "operation", "wallet_address", "delegate_address", "private_key", "submitted"}
+                    or not isinstance(result.get("private_key"), str)
+                    or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{64,88}", result["private_key"])):
+                raise RuntimeError("Phoenix generated credential invalid")
+        else:
+            if (result.get("delegate_address") != request["delegate_address"]
+                    or result.get("genesis_hash") != genesis_hash or result.get("platform") != PHOENIX_PLATFORM_ID
+                    or result.get("program_id") != PHOENIX_PROGRAM_ID or "private_key" in result
+                    or type(result.get("finalized_slot")) is not int or result["finalized_slot"] <= 0
+                    or type(result.get("delegation_verified")) is not bool
+                    or not isinstance(result.get("trader_account"), str)
+                    or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", result["trader_account"])):
+                raise RuntimeError("Phoenix setup readback binding failed")
+            if operation == "setup_prepare_delegation" and not result["delegation_verified"]:
+                if (any(type(result.get(key)) is not int or result[key] <= 0
+                        for key in ("fee_lamports", "last_valid_block_height"))
+                        or not isinstance(result.get("message_base64"), str)):
+                    raise RuntimeError("Phoenix unsigned delegation invalid")
+                try:
+                    message = base64.b64decode(result["message_base64"], validate=True)
+                    if not 80 <= len(message) <= 1232:
+                        raise ValueError("message size invalid")
+                except (ValueError, TypeError):
+                    raise RuntimeError("Phoenix unsigned delegation invalid") from None
+        return result
     if (
         result.get("platform") != PHOENIX_PLATFORM_ID
         or result.get("wallet_address") != payload["wallet_address"]
@@ -173,13 +222,22 @@ def phoenix_account_operation(
             if (not isinstance(prepared, Mapping) or not prepared.get("signature")
                 or result.get("signature") != prepared.get("signature")
                 or result.get("transaction_sha256") != prepared.get("transaction_sha256")
-                or state_name not in {"pending", "finalized", "failed"}
+                or state_name not in {"pending", "finalized", "failed", "expired"}
                 or type(result.get("send_attempted")) is not bool
                 or (operation == "read_submission" and result["send_attempted"])
                 or (result["send_attempted"] and (state_name != "pending" or type(result.get("transport_uncertain")) is not bool))
-                or (state_name == "pending" and slot is not None)
-                or (state_name != "pending" and (type(slot) is not int or not 0 < slot <= result["finalized_slot"]))):
+                or (state_name in {"pending", "expired"} and slot is not None)
+                or (state_name in {"finalized", "failed"} and (type(slot) is not int or not 0 < slot <= result["finalized_slot"]))):
                 raise RuntimeError("Phoenix signature status binding failed")
+            if state_name == "expired":
+                expiry = result.get("expiry")
+                if (not isinstance(expiry, dict) or expiry.get("history_status_absent") is not True
+                        or result["send_attempted"] is not False
+                        or any(type(expiry.get(key)) is not int for key in ("finalized_block_height", "last_valid_block_height"))
+                        or not expiry["finalized_block_height"] > expiry["last_valid_block_height"] > 0
+                        or type(prepared.get("last_valid_block_height")) is not int
+                        or expiry["last_valid_block_height"] != prepared["last_valid_block_height"]):
+                    raise RuntimeError("Phoenix signature expiry binding failed")
             execution = result.get("execution")
             if "entry" in request:
                 if not isinstance(execution, dict) or execution.get("status") not in {"verified", "unavailable"}:

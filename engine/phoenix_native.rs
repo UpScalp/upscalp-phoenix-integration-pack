@@ -14,8 +14,110 @@ use solana_rpc_client::rpc_client::RpcClient;
 use solana_rpc_client::api::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use sha2::{Digest, Sha256};
 use phoenix_rise::api::PhoenixHttpClient;
+use phoenix_rise::ix::prelude::{DelegateTraderParams, create_delegate_trader_ix};
+
+// Setup has no owner secret and no send operation. The browser wallet is the
+// sole signer/payer of the delegation and conditional trading-fee funding.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRequest {
+    operation: String,
+    wallet_address: String,
+    delegate_address: Option<String>,
+    rpc_url: String,
+    genesis_hash: String,
+}
+
+pub fn delegation_instruction(owner: Pubkey, delegate: Pubkey) -> Result<Instruction, &'static str> {
+    if owner == delegate || owner == Pubkey::default() || delegate == Pubkey::default() {
+        return Err("distinct_owner_delegate_required");
+    }
+    let params = DelegateTraderParams::builder().trader_wallet(owner)
+        .trader_account(TraderKey::new(owner).pda()).new_position_authority(delegate)
+        .build().map_err(|_| "delegation_instruction_invalid")?;
+    Ok(create_delegate_trader_ix(params).map_err(|_| "delegation_instruction_invalid")?.into())
+}
+
+pub fn delegation_account(owner: Pubkey, account: &FetchedAccount) -> Result<Pubkey, &'static str> {
+    if owner == Pubkey::default() || account.owner != Some(*PHOENIX_PROGRAM_ID) || account.executable {
+        return Err("trader_account_identity_invalid");
+    }
+    let trader = Trader::try_from_account_bytes(&account.data).map_err(|_| "trader_account_invalid")?;
+    if trader.authority != owner || trader.key != TraderKey::new(owner).pda()
+        || trader.trader_pda_index != 0 || trader.trader_subaccount_index != 0 {
+        return Err("trader_account_binding_invalid");
+    }
+    Ok(trader.position_authority)
+}
+
+pub fn run_delegation(request: DelegationRequest) -> Result<Value, &'static str> {
+    let rpc = RpcClient::new_with_timeout_and_commitment(request.rpc_url.clone(), Duration::from_secs(15), CommitmentConfig::finalized());
+    run_delegation_with_rpc(request, &rpc)
+}
+
+pub fn run_delegation_with_rpc(request: DelegationRequest, rpc: &RpcClient) -> Result<Value, &'static str> {
+    let owner = Pubkey::from_str(&request.wallet_address).map_err(|_| "wallet_address_invalid")?;
+    if owner == Pubkey::default() || !valid_https_endpoint(&request.rpc_url) || request.genesis_hash.is_empty() {
+        return Err("setup_identity_invalid");
+    }
+    if request.operation == "setup_generate_key" && request.delegate_address.is_none() {
+        let key = Keypair::new();
+        // IPC only: the caller must persist through the existing secret store
+        // before publishing an unsigned message, never forward this to HTTP.
+        return Ok(json!({"status":"ok", "operation":request.operation,
+            "wallet_address":owner.to_string(), "delegate_address":key.pubkey().to_string(),
+            "private_key":key.to_base58_string(), "submitted":false}));
+    }
+    if !matches!(request.operation.as_str(), "setup_prepare_delegation" | "setup_read_delegation") {
+        return Err("setup_operation_invalid");
+    }
+    let delegate = Pubkey::from_str(request.delegate_address.as_deref().ok_or("delegate_required")?)
+        .map_err(|_| "delegate_invalid")?;
+    let instruction = delegation_instruction(owner, delegate)?;
+    if rpc.get_genesis_hash().map_err(|_| "rpc_unavailable")?.to_string() != request.genesis_hash {
+        return Err("rpc_genesis_mismatch");
+    }
+    let address = TraderKey::new(owner).pda();
+    let snapshot = rpc.get_account_with_commitment(&address, CommitmentConfig::finalized()).map_err(|_| "rpc_unavailable")?;
+    let account = snapshot.value.ok_or("trader_account_absent")?;
+    let authority = delegation_account(owner, &FetchedAccount::new(account.data, account.owner, account.executable))?;
+    // Reconnection may replace an old delegate only through the unchanged
+    // owner-signed instruction. A status read never issues wallet bytes.
+    let mut result = json!({"status":"ok", "operation":request.operation, "platform":"phoenix",
+        "wallet_address":owner.to_string(), "delegate_address":delegate.to_string(),
+        "trader_account":address.to_string(), "program_id":PHOENIX_PROGRAM_ID.to_string(),
+        "genesis_hash":request.genesis_hash, "finalized_slot":snapshot.context.slot,
+        "delegation_verified":authority == delegate, "submitted":false});
+    if request.operation == "setup_read_delegation" || authority == delegate { return Ok(result); }
+    let delegate_balance = rpc.get_balance_with_commitment(&delegate, CommitmentConfig::finalized())
+        .map_err(|_| "delegate_balance_unavailable")?;
+    let transfer_lamports = if delegate_balance.value < 3_000_000 { 3_000_000_u64 } else { 0 };
+    let mut instructions = vec![instruction];
+    if transfer_lamports > 0 {
+        // SystemInstruction::Transfer: bincode enum index 2, then u64 lamports.
+        instructions.push(Instruction {
+            program_id: Pubkey::default(),
+            accounts: vec![solana_instruction::AccountMeta::new(owner, true),
+                solana_instruction::AccountMeta::new(delegate, false)],
+            data: [2_u32.to_le_bytes().as_slice(), transfer_lamports.to_le_bytes().as_slice()].concat(),
+        });
+    }
+    let (blockhash, expiry) = rpc.get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
+        .map_err(|_| "blockhash_unavailable")?;
+    let mut tx = Transaction::new_with_payer(&instructions, Some(&owner));
+    tx.message.recent_blockhash = blockhash;
+    let fee = rpc.get_fee_for_message(&tx.message).map_err(|_| "fee_unavailable")?;
+    let balance = rpc.get_balance_with_commitment(&owner, CommitmentConfig::finalized()).map_err(|_| "balance_unavailable")?;
+    let required = fee.checked_add(transfer_lamports).ok_or("owner_fee_balance_insufficient")?;
+    if fee == 0 || balance.value < required { return Err("owner_fee_balance_insufficient"); }
+    result["message_base64"] = json!(STANDARD.encode(tx.message_data()));
+    result["last_valid_block_height"] = json!(expiry);
+    result["fee_lamports"] = json!(fee);
+    Ok(result)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +214,9 @@ pub struct Target {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPlan {
+    // PO October12: explicit SOL Test Trade only; ordinary entries stay atomic/protected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_trade_unprotected: bool,
     pub symbol: String,
     pub direction: String,
     pub base_lots: u64,
@@ -136,15 +241,18 @@ pub async fn build_protected_entry(
     validate_account(owner, delegate, trader, trader_account)?;
     let builder = PhoenixTxBuilder::new(metadata);
     let market = metadata.get_market(&plan.symbol).ok_or("market_unknown")?;
+    if plan.test_trade_unprotected && plan.symbol != "SOL" { return Err("test_trade_symbol_invalid"); }
     let state = Trader::try_from_account_bytes(&trader_account.data).map_err(|_| "trader_account_invalid")?;
     if state.position_entries().any(|row| row.asset_id == u64::from(market.asset_id) && row.position.base_lot_position.as_inner() != 0) {
         return Err("existing_position_refused");
     }
     let long = match plan.direction.as_str() { "LONG" => true, "SHORT" => false, _ => return Err("direction_invalid") };
     if current_slot == 0 || plan.last_valid_slot <= current_slot || plan.client_order_id == 0
-        || plan.base_lots == 0 || plan.max_quote_lots == 0 || !(1..=2).contains(&plan.targets.len())
-        || plan.targets.iter().try_fold(0_u64, |sum, target| sum.checked_add(target.base_lots)) != Some(plan.base_lots)
-        || plan.targets.iter().any(|target| target.base_lots == 0) {
+        || plan.base_lots == 0 || plan.max_quote_lots == 0
+        || (!plan.test_trade_unprotected && (!(1..=2).contains(&plan.targets.len())
+            || plan.targets.iter().try_fold(0_u64, |sum, target| sum.checked_add(target.base_lots)) != Some(plan.base_lots)
+            || plan.targets.iter().any(|target| target.base_lots == 0)))
+        || (plan.test_trade_unprotected && (!plan.targets.is_empty() || plan.stop_price != 0.0 || plan.stop_execution_price != 0.0)) {
         return Err("entry_size_or_expiry_invalid");
     }
     let calc = builder.order_ticket_metadata(&plan.symbol).map_err(|_| "market_unknown")?.market_calc;
@@ -156,13 +264,14 @@ pub async fn build_protected_entry(
     };
     let entry = ticks(plan.reference_price)?;
     let limit = ticks(plan.limit_price)?;
-    let stop = ticks(plan.stop_price)?;
-    let stop_execution = ticks(plan.stop_execution_price)?;
-    if (long && (limit < entry || stop >= entry || stop_execution > stop))
-        || (!long && (limit > entry || stop <= entry || stop_execution < stop)) {
+    let stop = if plan.test_trade_unprotected { 0 } else { ticks(plan.stop_price)? };
+    let stop_execution = if plan.test_trade_unprotected { 0 } else { ticks(plan.stop_execution_price)? };
+    if (long && limit < entry) || (!long && limit > entry)
+        || (!plan.test_trade_unprotected && ((long && (stop >= entry || stop_execution > stop))
+            || (!long && (stop <= entry || stop_execution < stop)))) {
         return Err("protection_geometry_invalid");
     }
-    // Phoenix-only 1% maximum, measured from the encoded trigger.
+    // PO October10: Phoenix-only 1% maximum, measured from the encoded trigger.
     // Integer tick arithmetic also refuses nearest rounding outside the band.
     if plan.stop_execution_band_pct != 1.0
         || u128::from(stop.abs_diff(stop_execution)) * 100 > u128::from(stop) {
@@ -175,6 +284,7 @@ pub async fn build_protected_entry(
         previous = price;
     }
     let mut ixs = Vec::new();
+    if !plan.test_trade_unprotected {
     if let Some(account) = conditional_account {
         if account.owner != Some(*PHOENIX_PROGRAM_ID) || account.executable { return Err("conditional_account_invalid"); }
         let collection = ConditionalOrderCollection::try_from_account_bytes(&account.data).map_err(|_| "conditional_account_invalid")?;
@@ -186,6 +296,7 @@ pub async fn build_protected_entry(
     } else {
         ixs.extend(builder.build_create_conditional_orders_account(delegate, delegate, trader, 8).map_err(|_| "conditional_build_failed")?);
     }
+    }
     let side = if long { Side::Bid } else { Side::Ask };
     let ticket = MarketOrderTicket::builder().authority(delegate).trader_account(trader)
         .symbol(&plan.symbol).side(side).price(plan.limit_price).num_base_lots(plan.base_lots)
@@ -194,6 +305,11 @@ pub async fn build_protected_entry(
         .self_trade_behavior(SelfTradeBehavior::Abort).order_flags(OrderFlags::None)
         .cancel_existing(false).build().map_err(|_| "entry_build_failed")?;
     ixs.extend(builder.place_market_order(ticket).await.map_err(|_| "entry_build_failed")?);
+    if plan.test_trade_unprotected {
+        // Measured mainnet SOL entry needs >200k CU; no priority-fee instruction.
+        ixs.insert(0, ComputeBudgetInstruction::set_compute_unit_limit(400_000));
+        return Ok(ixs);
+    }
     // Atomic transaction: all entry lots and all protection, or none. The stop
     // tracks the remaining position; fixed TP lots preserve the configured split.
     ixs.extend(builder.build_bracket_leg_orders(delegate, trader, &plan.symbol, side, &BracketLegOrders {
@@ -405,10 +521,16 @@ pub fn project_state(
 
 // Serialize an already-signed transaction; no signing or submission here.
 pub fn prepared_transaction(tx: &Transaction, delegate: Pubkey) -> Result<Value, &'static str> {
+    let budget = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let test_only_pair = tx.message.instructions.len() == 2
+        && tx.message.instructions[0].accounts.is_empty()
+        && tx.message.instructions[0].data == budget.data
+        && tx.message.account_keys.get(usize::from(tx.message.instructions[0].program_id_index)) == Some(&budget.program_id)
+        && tx.message.account_keys.get(usize::from(tx.message.instructions[1].program_id_index)) == Some(&*PHOENIX_PROGRAM_ID);
     if tx.signatures.len() != 1 || tx.message.header.num_required_signatures != 1
         || tx.message.account_keys.first() != Some(&delegate) || tx.verify().is_err()
         || tx.message.instructions.is_empty()
-        || tx.message.instructions.iter().any(|ix| tx.message.account_keys.get(usize::from(ix.program_id_index)) != Some(&*PHOENIX_PROGRAM_ID)) {
+        || (!test_only_pair && tx.message.instructions.iter().any(|ix| tx.message.account_keys.get(usize::from(ix.program_id_index)) != Some(&*PHOENIX_PROGRAM_ID))) {
         return Err("prepared_transaction_invalid");
     }
     let bytes = bincode::serialize(tx).map_err(|_| "prepared_transaction_invalid")?;
@@ -458,6 +580,11 @@ pub fn validate_prepared(request: &Request, delegate: Pubkey) -> Result<Transact
         original
     } else { delegate };
     let canonical = prepared_transaction(&tx, delegate)?;
+    let has_budget = tx.message.account_keys.get(usize::from(tx.message.instructions[0].program_id_index))
+        == Some(&ComputeBudgetInstruction::set_compute_unit_limit(400_000).program_id);
+    if has_budget != request.entry.as_ref().is_some_and(|p| p.test_trade_unprotected && p.symbol == "SOL") {
+        return Err("prepared_test_mode_mismatch");
+    }
     if canonical.as_object().unwrap().iter().any(|(key, value)| prepared.get(key) != Some(value))
         || prepared["blockhash"].as_str() != Some(tx.message.recent_blockhash.to_string().as_str()) {
         return Err("prepared_transaction_invalid");
@@ -627,6 +754,7 @@ pub fn project_replacement(metadata: &PhoenixMetadata, plan: &ReplaceStopPlan,
         "trigger_ticks":stop, "execution_ticks":execution, "remaining_base_lots":plan.signed_base_lots.unsigned_abs()}))
 }
 
+// PO explicitly approved inactive submission code and synthetic tests only.
 // The caller persists the signature before invocation and reconciles uncertainty.
 pub fn dispatch_prepared_once(tx: &Transaction,
     send: impl FnOnce(&Transaction) -> Result<String, ()>) -> Result<Value, &'static str> {
@@ -781,13 +909,25 @@ fn run(request: Request) -> Result<Value, &'static str> {
     Ok(result)
 }
 
+pub fn run_input(input: &str) -> Result<Value, &'static str> {
+    #[derive(Deserialize)]
+    struct Operation { operation: String }
+    // Inspect only the discriminator. Parsing the entire request through Value
+    // would narrow existing u128 order IDs before typed Request deserialization.
+    let op: Operation = serde_json::from_str(input).map_err(|_| "request_invalid")?;
+    if op.operation.starts_with("setup_") {
+        serde_json::from_str::<DelegationRequest>(input).map_err(|_| "request_invalid").and_then(run_delegation)
+    } else {
+        serde_json::from_str::<Request>(input).map_err(|_| "request_invalid").and_then(run)
+    }
+}
+
 fn main() {
     let mut input = String::new();
     let result = io::stdin().take(16_385).read_to_string(&mut input)
         .map_err(|_| "request_invalid")
         .and_then(|_| if input.len() > 16_384 { Err("request_too_large") } else { Ok(()) })
-        .and_then(|_| serde_json::from_str::<Request>(&input).map_err(|_| "request_invalid"))
-        .and_then(run);
+        .and_then(|_| run_input(&input));
     match result {
         Ok(value) => println!("{value}"),
         Err(code) => {
